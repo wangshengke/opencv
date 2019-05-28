@@ -99,7 +99,8 @@ CV__DNN_INLINE_NS_BEGIN
         DNN_TARGET_OPENCL_FP16,
         DNN_TARGET_MYRIAD,
         DNN_TARGET_VULKAN,
-        DNN_TARGET_FPGA  //!< FPGA device with CPU fallbacks using Inference Engine's Heterogeneous plugin.
+        DNN_TARGET_FPGA,  //!< FPGA device with CPU fallbacks using Inference Engine's Heterogeneous plugin.
+        DNN_TARGET_CUDA_FP32
     };
 
     CV_EXPORTS std::vector< std::pair<Backend, Target> > getAvailableBackends();
@@ -184,6 +185,8 @@ CV__DNN_INLINE_NS_BEGIN
      *
      * Each class, derived from Layer, must implement allocate() methods to declare own outputs and forward() to compute outputs.
      * Also before using the new layer into networks you must register your layer by using one of @ref dnnLayerFactory "LayerFactory" macros.
+     *
+     * If a layer intends to provide a CUDA implementation, it must implement initCUDA() and forwardCUDA() methods.
      */
     class CV_EXPORTS_W Layer : public Algorithm
     {
@@ -229,6 +232,13 @@ CV__DNN_INLINE_NS_BEGIN
         virtual void forward(InputArrayOfArrays inputs, OutputArrayOfArrays outputs, OutputArrayOfArrays internals);
 
         /** @brief Given the @p input blobs, computes the output @p blobs.
+         *
+         * CUDA4DNN TODO
+         * Implementing this method is optional. If not implemented, the layer will fallback to the CPU version.
+         */
+        virtual void forwardCUDA();
+
+        /** @brief Given the @p input blobs, computes the output @p blobs.
          *  @param[in]  inputs  the input blobs.
          *  @param[out] outputs allocated output blobs, which will store results of the computation.
          *  @param[out] internals allocated internal blobs
@@ -272,6 +282,13 @@ CV__DNN_INLINE_NS_BEGIN
          * @see Backend
          */
         virtual bool supportBackend(int backendId);
+
+        /**
+         * @brief Initializes the layer to perform forward pass on GPU.
+         *
+         * CUDA4DNN TODO
+         */
+        virtual void initCUDA();
 
         /**
          * @brief Returns Halide backend node.
@@ -536,6 +553,7 @@ CV__DNN_INLINE_NS_BEGIN
          * | DNN_TARGET_OPENCL_FP16 |                  + |                            + |                    |
          * | DNN_TARGET_MYRIAD      |                    |                            + |                    |
          * | DNN_TARGET_FPGA        |                    |                            + |                    |
+         * | DNN_TARGET_CUDA_FP32   |                  + |                              |                    |
          */
         CV_WRAP void setPreferableTarget(int targetId);
 

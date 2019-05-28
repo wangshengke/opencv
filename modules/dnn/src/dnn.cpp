@@ -54,6 +54,7 @@
 #include <opencv2/dnn/shape_utils.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <opencv2/core/cuda.hpp>
 #include <opencv2/core/utils/configuration.private.hpp>
 #include <opencv2/core/utils/logger.hpp>
 
@@ -133,6 +134,11 @@ private:
             backends.push_back(std::make_pair(DNN_BACKEND_OPENCV, DNN_TARGET_OPENCL));
             backends.push_back(std::make_pair(DNN_BACKEND_OPENCV, DNN_TARGET_OPENCL_FP16));
         }
+#endif
+
+#ifdef HAVE_CUDA
+        if(cv::cuda::getCudaEnabledDeviceCount())
+            backends.push_back(std::make_pair(DNN_BACKEND_OPENCV, DNN_TARGET_CUDA_FP32));
 #endif
 
         backends.push_back(std::make_pair(DNN_BACKEND_OPENCV, DNN_TARGET_CPU));
@@ -445,6 +451,49 @@ private:
     bool hostDirty;
 };
 
+/* CUDA Tensors are represented by csl::Tensor
+** CUDABackendWrapperFP32 wraps a csl::TensorSpan<float>
+** It also maintains a reference to the csl::Tensor.
+*/
+class CUDABackendWrapperFP32 : public BackendWrapper {
+public:
+    CUDABackendWrapperFP32(Mat& m) : BackendWrapper(DNN_BACKEND_OPENCV, DNN_TARGET_CUDA_FP32) {
+        /* TODO:
+        ** 1. store a reference to cv::Mat
+        ** 2. create a csl::Tensor<float>
+        ** 3. create a csl::TensorSpan<float> (or store shape)
+        */
+    }
+
+    CUDABackendWrapperFP32(const Ptr<BackendWrapper>& base, const MatShape& shape)
+        : BackendWrapper(DNN_BACKEND_OPENCV, DNN_TARGET_CUDA_FP32) {
+        /* TODO:
+        ** 1. copy reference to csl::Tensor<float> of base
+        ** 2. set TensorSpan<float> to mimic `shape` (or store shape)
+        */
+    }
+
+    static Ptr<BackendWrapper> create(Mat& m)
+    {
+        return Ptr<BackendWrapper>(new CUDABackendWrapperFP32(m));
+    }
+
+    static Ptr<BackendWrapper> create(const Ptr<BackendWrapper>& base, const MatShape& shape)
+    {
+        return Ptr<BackendWrapper>(new CUDABackendWrapperFP32(base, shape));
+    }
+
+    virtual void copyToHost() CV_OVERRIDE { }
+    virtual void setHostDirty() CV_OVERRIDE { }
+
+    //TensorSpan<float> get_span();
+    //TensorView<float> get_view();
+
+    /* TensorSpan member vs create in get_span()
+    ** member tensor span can save shape changes
+    */
+};
+
 struct LayerPin
 {
     int lid;
@@ -674,6 +723,13 @@ struct DataLayer : public Layer
     }
 #endif
 
+#ifdef HAVE_CUDA
+    void forwardCUDA() CV_OVERRIDE
+    {
+         /* copy to device; standardize/normalize */
+    }
+#endif
+
     int outputNameToIndex(const String& tgtName) CV_OVERRIDE
     {
         int idx = (int)(std::find(outNames.begin(), outNames.end(), tgtName) - outNames.begin());
@@ -710,7 +766,7 @@ struct DataLayer : public Layer
         }
     }
 
-    virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper> >&) CV_OVERRIDE
+    virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper>>&) CV_OVERRIDE
     {
 #ifdef HAVE_INF_ENGINE
         CV_CheckEQ(inputsData.size(), (size_t)1, "");
@@ -753,6 +809,10 @@ struct DataLayer : public Layer
 #endif  // HAVE_INF_ENGINE
         return Ptr<BackendNode>();
     }
+
+#ifdef HAVE_CUDA
+    void initCUDA() { }
+#endif
 
     std::vector<String> outNames;
     // Preprocessing parameters for each network's input.
@@ -995,6 +1055,8 @@ static Ptr<BackendWrapper> wrapMat(int backendId, int targetId, cv::Mat& m)
             return Ptr<BackendWrapper>();
         else if (IS_DNN_OPENCL_TARGET(targetId))
             return OpenCLBackendWrapper::create(m);
+        else if (IS_DNN_CUDA_TARGET(targetId))
+            return CUDABackendWrapperFP32::create(m);
         else
             CV_Error(Error::StsNotImplemented, "Unknown target identifier");
     }
@@ -1084,8 +1146,10 @@ struct Net::Impl
             Ptr<BackendWrapper> baseBuffer = backendWrappers[data];
             if (preferableBackend == DNN_BACKEND_OPENCV)
             {
-                CV_Assert(IS_DNN_OPENCL_TARGET(preferableTarget));
-                return OpenCLBackendWrapper::create(baseBuffer, host);
+                if (IS_DNN_OPENCL_TARGET(preferableTarget))
+                    return OpenCLBackendWrapper::create(baseBuffer, host);
+                if (IS_DNN_CUDA_TARGET(preferableTarget))
+                    return CUDABackendWrapperFP32::create(baseBuffer, shape);
             }
             else if (preferableBackend == DNN_BACKEND_HALIDE)
             {
@@ -1197,7 +1261,8 @@ struct Net::Impl
         CV_Assert(preferableBackend != DNN_BACKEND_OPENCV ||
                   preferableTarget == DNN_TARGET_CPU ||
                   preferableTarget == DNN_TARGET_OPENCL ||
-                  preferableTarget == DNN_TARGET_OPENCL_FP16);
+                  preferableTarget == DNN_TARGET_OPENCL_FP16 ||
+                  preferableTarget == DNN_TARGET_CUDA_FP32);
         CV_Assert(preferableBackend != DNN_BACKEND_HALIDE ||
                   preferableTarget == DNN_TARGET_CPU ||
                   preferableTarget == DNN_TARGET_OPENCL);
@@ -1238,6 +1303,14 @@ struct Net::Impl
                 }
             }
 #endif
+            if (preferableBackend == DNN_BACKEND_OPENCV && IS_DNN_CUDA_TARGET(preferableTarget))
+            {
+#ifndef HAVE_CUDA
+                CV_LOG_WARNING(NULL, "DNN: CUDA target is not available in this OpenCV build, switching to CPU.");
+                preferableTarget = DNN_TARGET_CPU;
+#endif
+            }
+
             if (preferableBackend == DNN_BACKEND_VKCOM && !haveVulkan())
             {
                 preferableBackend = DNN_BACKEND_OPENCV;
@@ -1390,8 +1463,13 @@ struct Net::Impl
     void initBackend()
     {
         CV_TRACE_FUNCTION();
-        if (preferableBackend == DNN_BACKEND_OPENCV)
-            CV_Assert(preferableTarget == DNN_TARGET_CPU || IS_DNN_OPENCL_TARGET(preferableTarget));
+        if (preferableBackend == DNN_BACKEND_OPENCV) {
+            CV_Assert(preferableTarget == DNN_TARGET_CPU ||
+                     IS_DNN_OPENCL_TARGET(preferableTarget) ||
+                     IS_DNN_CUDA_TARGET(preferableTarget));
+            if (IS_DNN_CUDA_TARGET(preferableTarget))
+                initCUDA();
+        }
         else if (preferableBackend == DNN_BACKEND_HALIDE)
             initHalideBackend();
         else if (preferableBackend == DNN_BACKEND_INFERENCE_ENGINE)
@@ -1400,6 +1478,17 @@ struct Net::Impl
             initVkComBackend();
         else
             CV_Error(Error::StsNotImplemented, "Unknown backend identifier");
+    }
+
+    void initCUDA()
+    {
+#ifdef HAVE_CUDA
+        for (auto& layer : layers)
+        {
+            auto& ld = layer.second;
+            ld.layerInstance->initCUDA();
+        }
+#endif
     }
 
     void initHalideBackend()
@@ -2323,6 +2412,7 @@ struct Net::Impl
             std::map<int, Ptr<BackendNode> >::iterator it = ld.backendNodes.find(preferableBackend);
             if (preferableBackend == DNN_BACKEND_OPENCV || it == ld.backendNodes.end() || it->second.empty())
             {
+                /* CUDA4DNN TODO: async forward pass */
                 if (isAsync)
                     CV_Error(Error::StsNotImplemented, "Default implementation fallbacks in asynchronous mode");
 
@@ -2399,6 +2489,23 @@ struct Net::Impl
                         }
                     }
                     OpenCLBackendWrapper::update(ld.outputBlobsWrappers, umat_outputBlobs);
+                }
+                else if (preferableBackend == DNN_BACKEND_OPENCV && IS_DNN_CUDA_TARGET(preferableTarget))
+                {
+                    try
+                    {
+                        layer->forwardCUDA(); //(input, ld.outputBlobsWrappers, workspace);
+                    }
+                    catch (const cv::Exception& ex)
+                    {
+                        if (ex.code == Error::StsNotImplemented) {
+                            CV_LOG_WARNING(NULL, "Layer does not support CUDA. Switching to CPU implementation. ");
+                            auto actual_target = preferableTarget;
+                            preferableTarget = DNN_TARGET_CPU;
+                            forwardLayer(ld);
+                            preferableTarget = actual_target;
+                        }
+                    }
                 }
                 else
                 {
@@ -3606,6 +3713,27 @@ int Layer::outputNameToIndex(const String&)
 bool Layer::supportBackend(int backendId)
 {
     return backendId == DNN_BACKEND_OPENCV;
+}
+
+void Layer::initCUDA() {
+    /*
+    ** Implementing initCUDA is required iff the layer supports forward pass on CUDA devices.
+    ** Otherwise, the forward pass will fallback to CPU automatically.
+    **
+    ** Hence, if the derived class did not implement initCUDA, we do nothing here.
+    */
+}
+
+void Layer::forwardCUDA() {
+    /*
+    ** Implementing forwardCUDA is required iff the layer supports forward pass on CUDA devices.
+    ** Otherwise, the forward pass will fallback to CPU automatically.
+    **
+    ** Hence, if the derived class did not implement forwardCUDA, we throw to let the network know that
+    ** the layer does not support forward pass on CUDA devices. This will inform the network to use the
+    ** CPU version.
+    */
+    CV_Error(Error::StsNotImplemented, "Layer does not have a CUDA implementation");
 }
 
 Ptr<BackendNode> Layer::initVkCom(const std::vector<Ptr<BackendWrapper> > &)
