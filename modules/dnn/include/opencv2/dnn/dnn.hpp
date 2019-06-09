@@ -52,6 +52,11 @@
 
 #include <opencv2/dnn/dict.hpp>
 
+#include <opencv2/dnn/csl/cublas.hpp>
+#include <opencv2/dnn/csl/cudnn.hpp>
+#include <opencv2/dnn/csl/stream.hpp>
+#include <opencv2/dnn/csl/workspace.hpp>
+
 namespace cv {
 namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
@@ -247,11 +252,14 @@ CV__DNN_INLINE_NS_BEGIN
          *
          *  This method needs to be implemented iff the layer supports computation on a CUDA device. If not implemented,
          *  the forward pass is computed using the CPU.
+         *
+         *  If this method throws, the forward pass will be computed by the OpenCV backend on CPU.
          */
         virtual void forwardCUDA(
             std::vector<cv::Ptr<BackendWrapper>>& inputs,
-            std::vector<cv::Ptr<BackendWrapper>>& outputs
-            /* cuda4dnn::csl::workspace& workspace */);
+            std::vector<cv::Ptr<BackendWrapper>>& outputs,
+            cuda4dnn::csl::Workspace& workspace
+        );
 
         /** @brief
          * @overload
@@ -279,6 +287,7 @@ CV__DNN_INLINE_NS_BEGIN
          * This method maps label of input blob to its index into input vector.
          */
         virtual int inputNameToIndex(String inputName);
+
         /** @brief Returns index of output blob in output array.
          *  @see inputNameToIndex()
          */
@@ -310,19 +319,19 @@ CV__DNN_INLINE_NS_BEGIN
         /**
          * @brief Initializes the layer to perform forward pass on CUDA capable devices.
          *
-         * @params[in]  stream                  stream to use for operations
-         * @params[in]  cublas_handle           cuBLAS handle to use for cuBLAS operations
-         * @params[in]  cudnn_handle            cuDNN handle to use for cuDNN operations
-         * @params[out] scratch_mem_in_bytes    request extra device memory in bytes for internals
+         * @param[in]  stream                  stream to use for operations
+         * @param[in]  cublas_handle           cuBLAS handle to use for cuBLAS operations
+         * @param[in]  cudnn_handle            cuDNN handle to use for cuDNN operations
+         * @param[out] scratch_mem_in_bytes    request extra device memory in bytes for internals; defaults to zero
          *
-         * This method needs to be implemented iff the layer supports computation on a CUDA device.
+         * This method needs to be implemented iff the layer supports forward pass compuatation on CUDA devices.
          */
-        virtual void initCUDA(/*
+        virtual void initCUDA(
             cuda4dnn::csl::Stream stream,
             cuda4dnn::csl::cublas::Handle cublas_handle,
             cuda4dnn::csl::cudnn::Handle cudnn_handle,
             std::size_t& scratch_mem_in_bytes
-        */);
+        );
 
        /**
         * @brief Automatic Halide scheduling based on layer hyper-parameters.

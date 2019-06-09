@@ -45,6 +45,12 @@
 #include "op_vkcom.hpp"
 #include "op_cuda.hpp"
 #include "halide_scheduler.hpp"
+
+#include <opencv2/dnn/csl/stream.hpp>
+#include <opencv2/dnn/csl/cudnn.hpp>
+#include <opencv2/dnn/csl/cublas.hpp>
+#include <opencv2/dnn/csl/workspace.hpp>
+
 #include <set>
 #include <algorithm>
 #include <iostream>
@@ -682,11 +688,14 @@ struct DataLayer : public Layer
 #endif
 
 #ifdef HAVE_CUDA
-    void forwardCUDA(std::vector<cv::Ptr<BackendWrapper>>& inputs, std::vector<cv::Ptr<BackendWrapper>>& outputs) CV_OVERRIDE
+    void forwardCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        cuda4dnn::csl::Workspace& workspace) CV_OVERRIDE
     {
         /* standardize/normalize on device */
         // use CPU for now
-        Layer::forwardCUDA(inputs, outputs);
+        Layer::forwardCUDA(inputs, outputs, workspace);
     }
 #endif
 
@@ -771,7 +780,12 @@ struct DataLayer : public Layer
     }
 
 #ifdef HAVE_CUDA
-    void initCUDA() CV_OVERRIDE { }
+    void initCUDA(
+        cuda4dnn::csl::Stream stream,
+        cuda4dnn::csl::cublas::Handle cublas_handle,
+        cuda4dnn::csl::cudnn::Handle cudnn_handle,
+        std::size_t& scratch_mem_in_bytes
+    ) CV_OVERRIDE { }
 #endif
 
     std::vector<String> outNames;
@@ -1076,6 +1090,13 @@ struct Net::Impl
         preferableBackend = DNN_BACKEND_DEFAULT;
         preferableTarget = DNN_TARGET_CPU;
         skipInfEngineInit = false;
+
+#ifdef HAVE_CUDA
+        /* we do not use the member initializer list to decouple the evaluation order from the declaration order */
+        stream = cuda4dnn::csl::Stream(true);
+        cublasHandle = cuda4dnn::csl::cublas::Handle(stream);
+        cudnnHandle = cuda4dnn::csl::cudnn::Handle(stream);
+#endif
     }
 
     Ptr<DataLayer> netInputLayer;
@@ -1097,6 +1118,13 @@ struct Net::Impl
     bool isAsync;
     std::vector<int64> layersTimings;
     Mat output_blob;
+
+#ifdef HAVE_CUDA
+    cuda4dnn::csl::Stream stream;
+    cuda4dnn::csl::cublas::Handle cublasHandle;
+    cuda4dnn::csl::cudnn::Handle cudnnHandle;
+#endif
+    cuda4dnn::csl::Workspace workspace;
 
     Ptr<BackendWrapper> wrap(Mat& host)
     {
@@ -1875,7 +1903,9 @@ struct Net::Impl
         for (auto& layer : layers)
         {
             auto& ld = layer.second;
-            ld.layerInstance->initCUDA();
+            std::size_t workspace_size_required = 0;
+            ld.layerInstance->initCUDA(stream, cublasHandle, cudnnHandle, workspace_size_required);
+            workspace.require(workspace_size_required);
         }
 #endif
     }
@@ -1925,6 +1955,13 @@ struct Net::Impl
             for (size_t i = 0; i < ninputs; i++)
             {
                 ld.inputBlobsWrappers[i] = wrap(netInputLayer->inputsData[i]);
+#ifdef HAVE_CUDA
+                if (IS_DNN_CUDA_TARGET(preferableTarget))
+                {
+                    auto wrapper = ld.inputBlobsWrappers[i].dynamicCast<CUDABackendWrapperFP32>();
+                    wrapper->setStream(stream);
+                }
+#endif
             }
         }
         else
@@ -1953,11 +1990,19 @@ struct Net::Impl
         for (int i = 0; i < ld.outputBlobs.size(); ++i)
         {
             ld.outputBlobsWrappers[i] = wrap(ld.outputBlobs[i]);
+#ifdef HAVE_CUDA
+            if (IS_DNN_CUDA_TARGET(preferableTarget))
+            {
+                auto wrapper = ld.outputBlobsWrappers[i].dynamicCast<CUDABackendWrapperFP32>();
+                wrapper->setStream(stream);
+            }
+#endif
         }
         ld.internalBlobsWrappers.resize(ld.internals.size());
         for (int i = 0; i < ld.internals.size(); ++i)
         {
             ld.internalBlobsWrappers[i] = wrap(ld.internals[i]);
+            /* we don't set stream for CUDA backend wrappers for internals as they are not used */
         }
 
         Ptr<Layer> layerPtr = ld.getLayerInstance();
@@ -2540,11 +2585,18 @@ struct Net::Impl
                 {
                     try
                     {
-                        layer->forwardCUDA(ld.inputBlobsWrappers, ld.outputBlobsWrappers);
+                        CV_Assert(haveCUDA());
+#ifdef HAVE_CUDA
+                        layer->forwardCUDA(ld.inputBlobsWrappers, ld.outputBlobsWrappers, workspace);
+#endif
                     }
-                    catch (const cv::Exception&)
+                    catch (const cv::Exception& ex)
                     {
-                        CV_LOG_WARNING(NULL, "Layer does not support CUDA. Switching to CPU implementation. ");
+                        std::ostringstream os;
+                        os << ld.name << " >> " << ex.what();
+                        os << "Switching to CPU for this layer.\n";
+                        CV_LOG_WARNING(NULL, os.str().c_str());
+
                         auto actual_target = preferableTarget;
                         preferableBackend = DNN_BACKEND_OPENCV;
                         preferableTarget = DNN_TARGET_CPU;
@@ -2877,6 +2929,8 @@ Mat Net::forward(const String& outputName)
     std::vector<LayerPin> pins(1, impl->getPinByAlias(layerName));
     impl->setUpNet(pins);
     impl->forwardToLayer(impl->getLayerData(layerName));
+
+    impl->stream.synchronize();
 
     return impl->getBlob(layerName);
 }
@@ -3724,7 +3778,11 @@ bool Layer::supportBackend(int backendId)
     return backendId == DNN_BACKEND_OPENCV;
 }
 
-void Layer::initCUDA()
+void Layer::initCUDA(
+    cuda4dnn::csl::Stream stream,
+    cuda4dnn::csl::cublas::Handle cublas_handle,
+    cuda4dnn::csl::cudnn::Handle cudnn_handle,
+    std::size_t& scratch_mem_in_bytes)
 {
     /*
     ** Implementing initCUDA is required iff the layer supports forward pass on CUDA devices.
@@ -3734,7 +3792,10 @@ void Layer::initCUDA()
     */
 }
 
-void Layer::forwardCUDA(std::vector<cv::Ptr<BackendWrapper>>& inputs, std::vector<cv::Ptr<BackendWrapper>>& outputs)
+void Layer::forwardCUDA(
+    std::vector<cv::Ptr<BackendWrapper>>& inputs,
+    std::vector<cv::Ptr<BackendWrapper>>& outputs,
+    cuda4dnn::csl::Workspace& workspace)
 {
     /*
     ** Implementing forwardCUDA is required iff the layer supports forward pass on CUDA devices.

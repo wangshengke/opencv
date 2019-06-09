@@ -42,6 +42,7 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
 #include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include <opencv2/dnn/shape_utils.hpp>
@@ -123,6 +124,7 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA() && axis == 1) ||
                (backendId == DNN_BACKEND_HALIDE && haveHalide() && axis == 1) ||
                (backendId == DNN_BACKEND_INFERENCE_ENGINE && haveInfEngine() && axis == 1);
     }
@@ -415,6 +417,82 @@ public:
         }
     }
 
+#ifdef HAVE_CUDA
+    void forwardCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        cuda4dnn::csl::Workspace& workspace
+    )
+    {
+        CV_UNUSED(workspace);
+        CV_Assert(inputs.size() == 1 && outputs.size() == 1);
+
+        auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapperFP32>();
+        auto output_wrapper = outputs[0].dynamicCast<CUDABackendWrapperFP32>();
+
+        auto input = input_wrapper->getView();
+        auto output = output_wrapper->getSpan();
+
+        /* match dimensions of host matrix and tensor */
+        auto actual_dims = input_wrapper->host.dims;
+        CV_Assert(csl::tensor_utils::get_effective_rank(input) == actual_dims);
+
+        auto extra_dims = input.rank - actual_dims;
+        auto axis_tensor = clamp(axis, actual_dims) + extra_dims;
+
+        std::size_t batch_size = 1;
+        for (int i = 0; i < axis_tensor; i++)
+            batch_size *= input.get_axis_size(i);
+
+        auto input_size = input.size() / batch_size;
+        auto output_size = output.size() / batch_size;
+
+        for (std::size_t i = 0; i < batch_size; i++)
+        {
+            auto sample_input = input.subview(i * input_size, input_size, 1);
+            auto sample_output = output.subspan(i * output_size, output_size, 1);
+
+            CV_Assert(sample_input.size() == weightsTensor.get_axis_size(-1));
+            CV_Assert(sample_output.size() == weightsTensor.get_axis_size(-2));
+
+            csl::tensor_ops::multiply(cublasHandle, sample_output,
+                static_cast<csl::TensorView<float>>(weightsTensor),
+                static_cast<csl::TensorView<float>>(sample_input));
+
+            if (bias)
+            {
+                csl::tensor_ops::add(cublasHandle, sample_output,
+                    static_cast<csl::TensorView<float>>(biasTensor),
+                    static_cast<csl::TensorView<float>>(sample_output));
+            }
+        }
+    }
+
+    void initCUDA(
+        csl::Stream stream_,
+        csl::cublas::Handle cublas_handle,
+        csl::cudnn::Handle cudnn_handle,
+        std::size_t& scratch_mem_in_bytes
+    )
+    {
+        weightsTensor = createTensorHeaderFromMat(weightsMat);
+        CV_Assert(csl::tensor_utils::get_effective_rank(weightsTensor) == 2);
+        copyMatToTensor(weightsTensor, weightsMat, stream);
+
+        if (bias)
+        {
+            biasTensor = createTensorHeaderFromMat(biasMat);
+            copyMatToTensor(biasTensor, biasMat, stream);
+            biasTensor.reshape(-1, 1);
+
+            /* number of outputs = rows in weights = rows in bias */
+            CV_Assert(weightsTensor.get_axis_size(-2) == biasTensor.get_axis_size(-2));
+        }
+
+        /* THINK stream.synchronize(); */
+    }
+#endif
+
     virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
     {
 #ifdef HAVE_HALIDE
@@ -489,6 +567,12 @@ public:
         return flops;
 
     }
+
+#ifdef HAVE_CUDA
+    csl::Tensor<float> weightsTensor, biasTensor;
+    csl::cublas::Handle cublasHandle;
+    csl::Stream stream;
+#endif
 
     bool bias;
     Mat weightsMat, biasMat;

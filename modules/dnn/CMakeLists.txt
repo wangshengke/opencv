@@ -88,6 +88,7 @@ endif()
 
 if(OPENCV_DNN_CUDA AND HAVE_CUDA AND HAVE_CUBLAS AND HAVE_CUDNN)
   list(APPEND include_dirs ${CUDA_TOOLKIT_INCLUDE} ${CUDNN_INCLUDE_DIRS})
+  file(GLOB csl_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/${name}/csl/*.hpp")
 else()
   set(sources_options ${sources_options} EXCLUDE_CUDA)
 endif()
@@ -98,7 +99,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   ocv_append_source_files_cxx_compiler_options(fw_srcs "-Wno-inconsistent-missing-override")  # Clang
 endif()
-ocv_glob_module_sources(${sources_options} SOURCES ${fw_srcs})
+
+ocv_glob_module_sources(${sources_options} SOURCES ${fw_srcs} HEADERS ${csl_hdrs})
 ocv_create_module(${libs} ${INF_ENGINE_TARGET})
 ocv_add_samples()
 ocv_add_accuracy_tests(${INF_ENGINE_TARGET})
