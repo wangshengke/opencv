@@ -34,15 +34,25 @@ namespace cv {
         template <class tensor_span_type = cuda4dnn::csl::TensorSpan<float>> inline
         void copyMatToTensor(tensor_span_type& tensor, const cv::Mat& mat, const cuda4dnn::csl::Stream& stream) {
             CV_Assert(mat.total() == tensor.size());
+            cv::Mat source = mat;
+            if(!mat.isContinuous())
+                source = mat.clone();
+
             using T = typename tensor_span_type::value_type;
-            cuda4dnn::csl::memcpy<T>(tensor.get(), reinterpret_cast<T*>(mat.data), tensor.size(), stream);
+            cuda4dnn::csl::memcpy<T>(tensor.get(), reinterpret_cast<T*>(source.data), tensor.size(), stream);
         }
 
         template <class tensor_view_type = cuda4dnn::csl::TensorView<float>> inline
         void copyTensorToMat(cv::Mat& mat, tensor_view_type& tensor, const cuda4dnn::csl::Stream& stream) {
             CV_Assert(mat.total() == tensor.size());
+            cv::Mat source = mat;
+            if(!mat.isContinuous())
+                source = mat.clone();
+
             using T = typename tensor_view_type::value_type;
-            cuda4dnn::csl::memcpy<T>(reinterpret_cast<T*>(mat.data), tensor.get(), tensor.size(), stream);
+            cuda4dnn::csl::memcpy<T>(reinterpret_cast<T*>(source.data), tensor.get(), tensor.size(), stream);
+
+            source.copyTo(mat);
         }
 
         class CUDABackendWrapperFP32 final : public BackendWrapper {
