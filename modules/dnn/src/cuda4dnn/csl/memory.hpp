@@ -245,12 +245,18 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
     public:
         MemoryLockGuard() noexcept : ptr { nullptr } { }
         MemoryLockGuard(const MemoryLockGuard&) = delete;
-        MemoryLockGuard(MemoryLockGuard&&) = default;
+        MemoryLockGuard(MemoryLockGuard&& other) noexcept : ptr{ other.ptr } {
+            other.ptr = nullptr;
+        }
         MemoryLockGuard(void* ptr_, std::size_t size_in_bytes) : ptr{ ptr_ } {
             CUDA4DNN_CHECK_CUDA(cudaHostRegister(ptr_, size_in_bytes, cudaHostRegisterPortable));
         }
 
-        MemoryLockGuard& operator=(MemoryLockGuard&&) = default;
+        MemoryLockGuard& operator=(MemoryLockGuard&& other) noexcept {
+            ptr = other.ptr;
+            other.ptr = nullptr;
+            return *this;
+        }
         MemoryLockGuard& operator=(const MemoryLockGuard&) = delete;
 
         ~MemoryLockGuard() {
