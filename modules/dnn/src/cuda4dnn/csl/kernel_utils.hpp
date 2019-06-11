@@ -15,7 +15,7 @@
 #include <cuda_runtime.h>
 #endif
 
-namespace cv { namespace dnn { namespace cuda4dnn { namespace csl
+namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
 
 #ifdef __CUDACC__
     struct execution_policy {
@@ -47,7 +47,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl
     template <class Kernel, typename ...Args> inline
     void launch_kernel(Kernel kernel, Args ...args) {
         auto policy = make_optimal_policy(kernel);
-        kernel << <policy.grid, policy.block >> > (std::forward<Args>(args)...);
+        kernel <<<policy.grid, policy.block>>> (std::forward<Args>(args)...);
     }
 
     template <class Kernel, typename ...Args> inline
@@ -127,6 +127,8 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl
     using grid_stride_range_y = grid_stride_range_generic<1>;
     using grid_stride_range_z = grid_stride_range_generic<2>;
     using grid_stride_range = grid_stride_range_x;
+
+#endif /* __CUDACC__ */
 
 }}}}
 

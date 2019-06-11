@@ -9,6 +9,8 @@
 #include "memory.hpp"
 #include "cublas.hpp"
 #include "cudnn.hpp"
+#include "math.hpp"
+#include "span.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -719,6 +721,61 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
                 1.0, A.get(), A_nr,
                 1.0, B.get(), B_nr,
                 result.get(), dest_nr);
+        }
+
+        template <class T> inline
+        void abs(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            kernels::abs(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
+        }
+
+        template <class T> inline
+        void bnll(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            kernels::bnll(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
+        }
+
+        template <class T> inline
+        void relu(Stream stream, TensorSpan<T> dest, TensorView<T> src, T slope = 0) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            kernels::relu(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()), slope);
+        }
+
+        template <class T> inline
+        void clipped_relu(const Stream& stream, TensorSpan<T> dest, TensorView<T> src, T max, T min = 0) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            kernels::clipped_relu(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()), max, min);
+        }
+
+        template <class T> inline
+        void channelwise_relu(const Stream& stream, TensorSpan<T> dest, TensorView<T> src, TensorView<T> slope) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(src.get_axis_size(1) == slope.size());
+            CV_Assert(0); // TODO
+        }
+
+        template <class T> inline
+        void elu(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            kernels::elu(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
+        }
+
+        template <class T> inline
+        void power(const Stream& stream, TensorSpan<T> dest, TensorView<T> src, T exp = 1, T scale = 1, T shift = 0) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            kernels::power(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()), exp, scale, shift);
+        }
+
+        template <class T> inline
+        void sigmoid(Stream stream, TensorSpan<T> dest, TensorView<T> src) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            kernels::sigmoid(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
+        }
+
+        template <class T> inline
+        void tanh(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
+            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            kernels::tanh(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
         }
 
         template <class T> inline

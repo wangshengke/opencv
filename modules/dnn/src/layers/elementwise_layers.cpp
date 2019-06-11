@@ -42,6 +42,7 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
 #include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../op_vkcom.hpp"
@@ -50,6 +51,11 @@
 
 #ifdef HAVE_OPENCL
 #include "opencl_kernels_dnn.hpp"
+#endif
+
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/csl/tensor.hpp"
+using namespace cv::dnn::cuda4dnn;
 #endif
 
 namespace cv
@@ -229,6 +235,30 @@ public:
         func.apply(src, dst, len, planeSize, cn0, cn1);
     }
 
+
+#ifdef HAVE_CUDA
+    void forwardCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace
+    )
+    {
+        func.applyCUDA(inputs, outputs, workspace, stream);
+    }
+
+    void initCUDA(
+        csl::Stream stream_,
+        csl::cublas::Handle cublas_handle,
+        csl::cudnn::Handle cudnn_handle,
+        std::size_t& scratch_mem_in_bytes
+    )
+    {
+        stream = std::move(stream_);
+    }
+
+    csl::Stream stream;
+#endif
+
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
                            const std::vector<MatShape> &outputs) const CV_OVERRIDE
     {
@@ -269,7 +299,9 @@ struct ReLUFunctor
         if (backendId == DNN_BACKEND_INFERENCE_ENGINE)
             return slope >= 0 || !INF_ENGINE_VER_MAJOR_EQ(INF_ENGINE_RELEASE_2019R1);
 #endif
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE ||
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_VKCOM;
     }
 
@@ -304,6 +336,27 @@ struct ReLUFunctor
             }
         }
     }
+
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::relu(stream, output, input, slope);
+        }
+    }
+#endif
 
 #ifdef HAVE_OPENCL
     bool initKernel(ocl::Kernel &ker, const UMat &src) const
@@ -411,7 +464,9 @@ struct ReLU6Functor
 
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE ||
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_INFERENCE_ENGINE;
     }
 
@@ -479,6 +534,27 @@ struct ReLU6Functor
     }
 #endif
 
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::clipped_relu(stream, output, input, minValue, maxValue);
+        }
+    }
+#endif
+
 #ifdef HAVE_HALIDE
     void attachHalide(const Halide::Expr& input, Halide::Func& top)
     {
@@ -528,7 +604,9 @@ struct TanHFunctor
 
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE ||
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_INFERENCE_ENGINE;
     }
 
@@ -569,6 +647,27 @@ struct TanHFunctor
         }
 
         return true;
+    }
+#endif
+
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::tanh(stream, output, input);
+        }
     }
 #endif
 
@@ -617,7 +716,9 @@ struct SigmoidFunctor
 
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE ||
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_INFERENCE_ENGINE;
     }
 
@@ -658,6 +759,27 @@ struct SigmoidFunctor
         }
 
         return true;
+    }
+#endif
+
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::sigmoid(stream, output, input);
+        }
     }
 #endif
 
@@ -708,7 +830,9 @@ struct ELUFunctor
 
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE ||
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_INFERENCE_ENGINE;
     }
 
@@ -749,6 +873,27 @@ struct ELUFunctor
         }
 
         return true;
+    }
+#endif
+
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::elu(stream, output, input);
+        }
     }
 #endif
 
@@ -800,7 +945,9 @@ struct AbsValFunctor
         if (backendId == DNN_BACKEND_INFERENCE_ENGINE)
             return !INF_ENGINE_VER_MAJOR_EQ(INF_ENGINE_RELEASE_2019R1);
 #endif
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE;
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+               backendId == DNN_BACKEND_HALIDE;
     }
 
     void apply(const float* srcptr, float* dstptr, int len, size_t planeSize, int cn0, int cn1) const
@@ -840,6 +987,27 @@ struct AbsValFunctor
         }
 
         return true;
+    }
+#endif
+
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::abs(stream, output, input);
+        }
     }
 #endif
 
@@ -890,7 +1058,9 @@ struct BNLLFunctor
 
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE;
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+               backendId == DNN_BACKEND_HALIDE;
     }
 
     void apply(const float* srcptr, float* dstptr, int len, size_t planeSize, int cn0, int cn1) const
@@ -910,6 +1080,27 @@ struct BNLLFunctor
     {
         // TODO: implement OCL version
         return false;
+    }
+#endif
+
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::bnll(stream, output, input);
+        }
     }
 #endif
 
@@ -967,7 +1158,9 @@ struct PowerFunctor
         if (backendId == DNN_BACKEND_INFERENCE_ENGINE)
             return (targetId != DNN_TARGET_OPENCL && targetId != DNN_TARGET_OPENCL_FP16) || power == 1.0 || power == 0.5;
         else
-            return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE;
+            return backendId == DNN_BACKEND_OPENCV ||
+                   (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+                   backendId == DNN_BACKEND_HALIDE;
     }
 
     void apply(const float* srcptr, float* dstptr, int len, size_t planeSize, int cn0, int cn1) const
@@ -1025,6 +1218,27 @@ struct PowerFunctor
         }
 
         return true;
+    }
+#endif
+
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::power(stream, output, input, power, scale, shift);
+}
     }
 #endif
 
@@ -1128,7 +1342,9 @@ struct ChannelsPReLUFunctor
 
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_HALIDE ||
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA()) ||
+               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_INFERENCE_ENGINE;
     }
 
@@ -1201,6 +1417,35 @@ struct ChannelsPReLUFunctor
 
         return true;
     }
+#endif
+
+#ifdef HAVE_CUDA
+    void applyCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace,
+        const csl::Stream& stream
+    )
+    {
+       /* if(slopeTensor.size() == 0)
+        {
+            slopeTensor = createTensorHeaderFromMat(scale);
+            copyMatToTensor(slopeTensor, scale, stream);
+        }
+
+        for (std::size_t i = 0; i < inputs.size(); i++)
+        {
+            auto input_wrapper = inputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+
+            auto input = input_wrapper->getView();
+            auto output = output_wrapper->getSpan();
+
+            csl::tensor_ops::channelwise_relu<float>(stream, output, input, slopeTensor);
+        }*/
+    }
+
+    //csl::Tensor<float> slopeTensor;
 #endif
 
 #ifdef HAVE_HALIDE

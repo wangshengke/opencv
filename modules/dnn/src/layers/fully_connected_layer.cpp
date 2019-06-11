@@ -426,7 +426,7 @@ public:
     void forwardCUDA(
         std::vector<cv::Ptr<BackendWrapper>>& inputs,
         std::vector<cv::Ptr<BackendWrapper>>& outputs,
-        cuda4dnn::csl::Workspace& workspace
+        csl::Workspace& workspace
     )
     {
         CV_UNUSED(workspace);
