@@ -8,16 +8,7 @@
 #include <cudnn.h>
 #include <memory>
 
-#define CUDA4DNN_CHECK_CUDNN(call) \
-    ::cv::dnn::cuda4dnn::csl::cudnn::check((call), CV_Func, __FILE__, __LINE__)
-
 namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace cudnn {
-
-    static void check(cudnnStatus_t status, const char* func, const char* file, int line) {
-        if (status != CUDNN_STATUS_SUCCESS)
-            throw cuDNNException(Error::GpuApiCallError, cudnnGetErrorString(status), func, file, line);
-    }
-
     /** @brief noncopyable cuDNN smart handle
      *
      * UniqueHandle is a smart non-sharable wrapper for cuDNN handle which ensures that the handle
@@ -70,7 +61,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace cu
     /** used to access the raw cuDNN handle held by Handle */
     class HandleAccessor {
     public:
-        static cudnnHandle_t get(Handle& handle) {
+        static cudnnHandle_t get(const Handle& handle) {
             CV_Assert(handle);
             return handle.handle->get();
         }
@@ -79,5 +70,41 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace cu
     Handle::Handle() : handle(std::make_shared<Handle::UniqueHandle>()) { }
     Handle::Handle(Stream strm) : handle(std::make_shared<Handle::UniqueHandle>(std::move(strm))) { }
     Handle::operator bool() const noexcept { return static_cast<bool>(handle); }
+
+    template <>
+    void softmax(const cudnn::Handle& handle,
+            const TensorDescriptor<float>& output_desc, DevicePtr<float> output_data,
+            const TensorDescriptor<float>& input_desc, DevicePtr<const float> input_data,
+            bool log)
+    {
+        float alpha = 1.0, beta = 0.0;
+        cudnnSoftmaxAlgorithm_t algo = log ? CUDNN_SOFTMAX_LOG : CUDNN_SOFTMAX_ACCURATE;
+        CUDA4DNN_CHECK_CUDNN(
+            cudnnSoftmaxForward(
+                HandleAccessor::get(handle),
+                algo, CUDNN_SOFTMAX_MODE_CHANNEL,
+                &alpha, input_desc.get(), input_data.get(),
+                &beta, output_desc.get(), output_data.get()
+            )
+        );
+    }
+
+    template <>
+    void softmax(const cudnn::Handle& handle,
+        const TensorDescriptor<double>& output_desc, DevicePtr<double> output_data,
+        const TensorDescriptor<double>& input_desc, DevicePtr<const double> input_data,
+        bool log)
+    {
+        double alpha = 1.0, beta = 0.0;
+        cudnnSoftmaxAlgorithm_t algo = log ? CUDNN_SOFTMAX_LOG : CUDNN_SOFTMAX_ACCURATE;
+        CUDA4DNN_CHECK_CUDNN(
+            cudnnSoftmaxForward(
+                HandleAccessor::get(handle),
+                algo, CUDNN_SOFTMAX_MODE_CHANNEL,
+                &alpha, input_desc.get(), input_data.get(),
+                &beta, output_desc.get(), output_data.get()
+            )
+        );
+    }
 
 }}}}} /* namespace cv::dnn::cuda4dnn::csl::cudnn */

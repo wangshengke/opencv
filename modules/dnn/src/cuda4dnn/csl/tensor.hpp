@@ -8,6 +8,7 @@
 #include "nvcc_defs.hpp"
 #include "memory.hpp"
 #include "cublas.hpp"
+#include "cudnn.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -718,6 +719,29 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
                 1.0, A.get(), A_nr,
                 1.0, B.get(), B_nr,
                 result.get(), dest_nr);
+        }
+
+        template <class T> inline
+        void softmax(const cudnn::Handle& handle, TensorSpan<T> output, TensorView<T> input, bool log) {
+            CV_Assert(input.rank == 4 && output.rank == 4);
+            CV_Assert(tensor_utils::is_same_shape(output, input));
+
+            using cudnn::TensorDescriptor;
+            auto input_desc = TensorDescriptor<T>(
+                input.get_axis_size(0),
+                input.get_axis_size(1),
+                input.get_axis_size(2),
+                input.get_axis_size(3)
+            );
+
+            auto output_desc = TensorDescriptor<T>(
+                output.get_axis_size(0),
+                output.get_axis_size(1),
+                output.get_axis_size(2),
+                output.get_axis_size(3)
+            );
+
+            cudnn::softmax(handle, output_desc, output.get(), input_desc, input.get(), log);
         }
     }
 
