@@ -5,6 +5,8 @@
 #include "precomp.hpp"
 #include "op_cuda.hpp"
 
+#include <opencv2/dnn/shape_utils.hpp>
+
 #ifdef HAVE_CUDA
 using namespace cv::dnn::cuda4dnn;
 #endif
@@ -13,29 +15,29 @@ namespace cv {
     namespace dnn {
 #ifdef HAVE_CUDA
         CUDABackendWrapperFP32::CUDABackendWrapperFP32(Mat& m)
-            : BackendWrapper(DNN_BACKEND_OPENCV, DNN_TARGET_CUDA_FP32), host(m)
+            : BackendWrapper(DNN_BACKEND_OPENCV, DNN_TARGET_CUDA_FP32)
         {
             CV_Assert(m.isContinuous());
             CV_Assert(m.type() == CV_32F);
             CV_Assert(m.size.dims() <= tensor_type::rank);
 
+            shape = cv::dnn::shape(m);
+
             shared_block = std::make_shared<shared_block_type>();
             shared_block->host_dirty = true;
             shared_block->device_dirty = false;
+            shared_block->host = m;
             shared_block->memGuard = cuda4dnn::csl::MemoryLockGuard(m.data, m.total() * sizeof(float));
-            shared_block->parent = createTensorHeaderFromMat<tensor_type>(host);
-
-            span = tensor_span_type(shared_block->parent);
+            shared_block->parent = createTensorHeaderFromMat<tensor_type>(m);
         }
 
-        CUDABackendWrapperFP32::CUDABackendWrapperFP32(const Ptr<BackendWrapper>& base_, const MatShape& shape)
+        CUDABackendWrapperFP32::CUDABackendWrapperFP32(const Ptr<BackendWrapper>& base_, const MatShape& shape_)
             : BackendWrapper(DNN_BACKEND_OPENCV, DNN_TARGET_CUDA_FP32)
         {
             const Ptr<CUDABackendWrapperFP32> base = base_.dynamicCast<CUDABackendWrapperFP32>();
-            host = base->host;
 
+            shape = shape_;
             shared_block = base->shared_block;
-            span = base->span.subspan(0, std::begin(shape), std::end(shape));
         }
 
         Ptr<BackendWrapper> CUDABackendWrapperFP32::create(Mat& m)
@@ -48,10 +50,15 @@ namespace cv {
             return Ptr<BackendWrapper>(new CUDABackendWrapperFP32(base, shape));
         }
 
+        /* blocking */
         void CUDABackendWrapperFP32::copyToHost() {
             if(shared_block->device_dirty) {
                 shared_block->device_dirty = false;
-                copyTensorToMat(host, span, shared_block->stream);
+
+                auto view = tensor_view_type(shared_block->parent).subview(0, std::begin(shape), std::end(shape));
+                copyTensorToMat(shared_block->host, view, shared_block->stream);
+
+                shared_block->stream.synchronize();
             }
         }
 
@@ -60,14 +67,20 @@ namespace cv {
             shared_block->host_dirty = true;
         }
 
+        /* non-blocking
+         * we don't have to block for copying to device because all operations are put into a stream which
+         * ensures that the operations added to the stream are peformed in order
+         */
         void CUDABackendWrapperFP32::copyToDevice() {
             if(shared_block->host_dirty) {
                 shared_block->host_dirty = false;
-                copyMatToTensor(span, host, shared_block->stream);
+
+                auto span = tensor_span_type(shared_block->parent).subspan(0, std::begin(shape), std::end(shape));
+                copyMatToTensor(span, shared_block->host, shared_block->stream);
             }
         }
 
-        void CUDABackendWrapperFP32::setDeviceDirty() {
+        void CUDABackendWrapperFP32::setDeviceDirty() noexcept {
             shared_block->device_dirty = true;
             shared_block->host_dirty = false;
         }
@@ -76,14 +89,14 @@ namespace cv {
             shared_block->stream = std::move(stream);
         }
 
-        CUDABackendWrapperFP32::tensor_span_type& CUDABackendWrapperFP32::getSpan() noexcept {
-            shared_block->device_dirty = true;
-            return span;
+        CUDABackendWrapperFP32::tensor_span_type CUDABackendWrapperFP32::getSpan() noexcept {
+            setDeviceDirty();
+            return tensor_span_type(shared_block->parent).subspan(0, std::begin(shape), std::end(shape));
         }
 
         CUDABackendWrapperFP32::tensor_view_type CUDABackendWrapperFP32::getView() noexcept {
             copyToDevice();
-            return static_cast<tensor_view_type>(span);
+            return tensor_view_type(shared_block->parent).subview(0, std::begin(shape), std::end(shape));
         }
 
 #endif

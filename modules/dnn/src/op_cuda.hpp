@@ -33,7 +33,7 @@ namespace cv {
 
         template <class tensor_span_type = cuda4dnn::csl::TensorSpan<float>> inline
         void copyMatToTensor(tensor_span_type& tensor, const cv::Mat& mat, const cuda4dnn::csl::Stream& stream) {
-            CV_Assert(mat.total() == tensor.size());
+            CV_Assert(mat.total() >= tensor.size());
             cv::Mat source = mat;
             if(!mat.isContinuous())
                 source = mat.clone();
@@ -44,7 +44,7 @@ namespace cv {
 
         template <class tensor_view_type = cuda4dnn::csl::TensorView<float>> inline
         void copyTensorToMat(cv::Mat& mat, tensor_view_type& tensor, const cuda4dnn::csl::Stream& stream) {
-            CV_Assert(mat.total() == tensor.size());
+            CV_Assert(mat.total() >= tensor.size());
             cv::Mat source = mat;
             if(!mat.isContinuous())
                 source = mat.clone();
@@ -52,7 +52,8 @@ namespace cv {
             using T = typename tensor_view_type::value_type;
             cuda4dnn::csl::memcpy<T>(reinterpret_cast<T*>(source.data), tensor.get(), tensor.size(), stream);
 
-            source.copyTo(mat);
+            if(source.data != mat.data)
+                source.copyTo(mat);
         }
 
         class CUDABackendWrapperFP32 final : public BackendWrapper {
@@ -72,21 +73,42 @@ namespace cv {
             void setHostDirty() override;
 
             void copyToDevice();
-            void setDeviceDirty();
+            void setDeviceDirty() noexcept;
 
+            MatShape getShape() const noexcept { return shape; }
+
+            /** @note setting the stream updates the stream for all wrappers which use the same buffer */
             void setStream(cuda4dnn::csl::Stream stream) noexcept;
-            tensor_span_type& getSpan() noexcept;
+
+            /* Optimization Note:
+             * use getSpan() and getView() judiciously
+             *
+             * getSpan() is meant to be used when the memory is going to be modified
+             * getView() is meant to be used when the memory is only going to be read
+             *
+             * getSpan() marks the device memory as dirty but getView() does not
+             */
+            tensor_span_type getSpan() noexcept;
             tensor_view_type getView() noexcept;
 
-            cv::Mat host;
-
         private:
-            tensor_span_type span;
+            /* The same device memory can be reused by different layers whenever possible.
+             * Hence, it is possible for different backend warppers to point to the same device memory.
+             * However, it may use only a part of the total device memory and have a different shape.
+             *
+             * We store the common information such as device tensor and its corresponding in host memory in
+             * a shared block. The shared block is shared by all backend wrappers which use the same device memory.
+             * The shape, which can be different for different wrappers, is stored as a member object.
+             */
+
+            MatShape shape;
 
             struct shared_block_type {
                 bool host_dirty;
                 bool device_dirty;
-                cuda4dnn::csl::MemoryLockGuard memGuard;
+
+                cv::Mat host;
+                cuda4dnn::csl::MemoryLockGuard memGuard; /* keeps host memory page-locked */
 
                 tensor_type parent;
                 cuda4dnn::csl::Stream stream;
