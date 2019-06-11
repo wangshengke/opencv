@@ -2930,7 +2930,9 @@ Mat Net::forward(const String& outputName)
     impl->setUpNet(pins);
     impl->forwardToLayer(impl->getLayerData(layerName));
 
+#ifdef HAVE_CUDA
     impl->stream.synchronize();
+#endif
 
     return impl->getBlob(layerName);
 }
