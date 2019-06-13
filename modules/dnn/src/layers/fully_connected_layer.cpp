@@ -440,7 +440,7 @@ public:
             auto output = output_wrapper->getSpan();
 
             auto actual_dims = input_wrapper->getShape().size();
-            CV_Assert(csl::tensor_utils::get_effective_rank(input) <= actual_dims);
+            CV_Assert(get_effective_rank(input) <= actual_dims);
 
             auto extra_dims = input.rank - actual_dims;
             auto flatten_start_axis = clamp(axis, actual_dims) + extra_dims;
@@ -478,7 +478,7 @@ public:
         cublasHandle = std::move(cublas_handle);
 
         weightsTensor = createTensorHeaderFromMat(weightsMat);
-        CV_Assert(csl::tensor_utils::get_effective_rank(weightsTensor) == 2);
+        CV_Assert(get_effective_rank(weightsTensor) == 2);
         copyMatToTensor(weightsTensor, weightsMat, stream);
 
         if (bias)

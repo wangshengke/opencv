@@ -146,9 +146,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
          * - at most one axis length is allowed for length deduction
          * - the lengths provided must ensure that the total number of elements remains unchnged
          *
-         * Post-conditions:
-         * - if an axis was left unspecified, the value will be updated to have the correct size
-         *
          * Exception Guarantee: Strong
          */
         template <class ForwardItr>
@@ -166,7 +163,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             /* sizes must be positive numbers with the exception of -1 */
             auto invalid_sizes = std::count_if(start, end, [](ItrValueType x) {
                 return !(x > 0 || x == -1);
-                });
+            });
             if (invalid_sizes) { CV_Error(Error::StsBadArg, "invalid axis size"); }
 
             /* compute the total number of elements in the new tensor */
@@ -625,32 +622,30 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         return TensorView<T, rank_>(*this);
     }
 
-    namespace tensor_utils {
-        /** returns true if the two Tensor/TensorSpan/TensorView objects have the same shape */
-        template <class TensorType1, class TensorType2> inline
-            bool is_same_shape(const TensorType1& x, const TensorType2& y) noexcept {
-            constexpr auto rank1 = TensorType1::rank;
-            constexpr auto rank2 = TensorType2::rank;
+    /** returns true if the two Tensor/TensorSpan/TensorView objects have the same shape */
+    template <class TensorType1, class TensorType2> inline
+        bool is_same_shape(const TensorType1& x, const TensorType2& y) noexcept {
+        constexpr auto rank1 = TensorType1::rank;
+        constexpr auto rank2 = TensorType2::rank;
 
-            if (rank1 != rank2)
+        if (rank1 != rank2)
+            return false;
+
+        for (int i = 0; i < rank1; i++)
+            if (x.get_axis_size(i) != y.get_axis_size(i))
                 return false;
+        return true;
+    }
 
-            for (int i = 0; i < rank1; i++)
-                if (x.get_axis_size(i) != y.get_axis_size(i))
-                    return false;
-            return true;
-        }
-
-        /** returns the rank to which the given tensor can be squeezed to */
-        template <class TensorType> inline
-        std::size_t get_effective_rank(const TensorType& x) noexcept {
-            constexpr auto rank = TensorType::rank;
-            std::size_t effective_rank = rank;
-            for (int i = 0; i < rank; i++, effective_rank--)
-                if (x.get_axis_size(i) != 1)
-                    break;
-            return effective_rank;
-        }
+    /** returns the rank to which the given tensor can be squeezed to */
+    template <class TensorType> inline
+    std::size_t get_effective_rank(const TensorType& x) noexcept {
+        constexpr auto rank = TensorType::rank;
+        std::size_t effective_rank = rank;
+        for (int i = 0; i < rank; i++, effective_rank--)
+            if (x.get_axis_size(i) != 1)
+                break;
+        return effective_rank;
     }
 
     namespace tensor_ops {
@@ -666,7 +661,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         template <class T> inline
         void multiply(const cublas::Handle& handle, TensorSpan<T> result, TensorView<T> A, TensorView<T> B) {
             /* matrix operations can be performed only on rank two tensors */
-            using tensor_utils::get_effective_rank;
             CV_Assert(get_effective_rank(A) == 2 &&
                       get_effective_rank(B) == 2 &&
                       get_effective_rank(result) == 2);
@@ -701,14 +695,13 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         template <class T> inline
         void add(const cublas::Handle& handle, TensorSpan<T> result, TensorView<T> A, TensorView<T> B) {
             /* matrix operations can be performed only on rank two tensors */
-            using tensor_utils::get_effective_rank;
             CV_Assert(get_effective_rank(A) == 2 &&
                       get_effective_rank(B) == 2 &&
                       get_effective_rank(result) == 2);
 
             /* check dimension requirements for matrix addition */
-            CV_Assert(tensor_utils::is_same_shape(A, B));
-            CV_Assert(tensor_utils::is_same_shape(A, result));
+            CV_Assert(is_same_shape(A, B));
+            CV_Assert(is_same_shape(A, result));
 
             const auto dest_nr = result.get_axis_size(-2);
             const auto dest_nc = result.get_axis_size(-1);
@@ -725,63 +718,63 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
 
         template <class T> inline
         void abs(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             kernels::abs(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
         }
 
         template <class T> inline
         void bnll(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             kernels::bnll(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
         }
 
         template <class T> inline
         void relu(Stream stream, TensorSpan<T> dest, TensorView<T> src, T slope = 0) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             kernels::relu(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()), slope);
         }
 
         template <class T> inline
         void clipped_relu(const Stream& stream, TensorSpan<T> dest, TensorView<T> src, T max, T min = 0) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             kernels::clipped_relu(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()), max, min);
         }
 
         template <class T> inline
         void channelwise_relu(const Stream& stream, TensorSpan<T> dest, TensorView<T> src, TensorView<T> slope) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             CV_Assert(src.get_axis_size(1) == slope.size());
             CV_Assert(0); // TODO
         }
 
         template <class T> inline
         void elu(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             kernels::elu(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
         }
 
         template <class T> inline
         void power(const Stream& stream, TensorSpan<T> dest, TensorView<T> src, T exp = 1, T scale = 1, T shift = 0) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             kernels::power(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()), exp, scale, shift);
         }
 
         template <class T> inline
         void sigmoid(Stream stream, TensorSpan<T> dest, TensorView<T> src) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             kernels::sigmoid(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
         }
 
         template <class T> inline
         void tanh(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
-            CV_Assert(tensor_utils::is_same_shape(dest, src));
+            CV_Assert(is_same_shape(dest, src));
             kernels::tanh(stream, span<T>(dest.get(), dest.size()), view<T>(src.get(), src.size()));
         }
 
         template <class T> inline
         void softmax(const cudnn::Handle& handle, TensorSpan<T> output, TensorView<T> input, bool log) {
             CV_Assert(input.rank == 4 && output.rank == 4);
-            CV_Assert(tensor_utils::is_same_shape(output, input));
+            CV_Assert(is_same_shape(output, input));
 
             using cudnn::TensorDescriptor;
             auto input_desc = TensorDescriptor<T>(

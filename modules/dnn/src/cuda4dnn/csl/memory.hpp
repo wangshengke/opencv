@@ -87,7 +87,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
          */
         void reset(std::size_t count) {
             /* avoid unncessary reallocations */
-            if (count <= n && (count > n / 2 || count * sizeof(T) < 256))
+            if (count <= n && (count > n / 2 || n * sizeof(T) < 256))
                 return;
 
             ManagedPtr tmp(count);

@@ -38,7 +38,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
     };
 
     template <class Kernel> inline
-    execution_policy make_optimal_policy(Kernel kernel, std::size_t sharedMem = 0, const Stream& stream = 0) {
+    execution_policy make_policy(Kernel kernel, std::size_t sharedMem = 0, const Stream& stream = 0) {
         int grid_size, block_size;
         CUDA4DNN_CHECK_CUDA(cudaOccupancyMaxPotentialBlockSize(&grid_size, &block_size, kernel, sharedMem));
         return execution_policy(grid_size, block_size, sharedMem, stream);
@@ -46,7 +46,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
 
     template <class Kernel, typename ...Args> inline
     void launch_kernel(Kernel kernel, Args ...args) {
-        auto policy = make_optimal_policy(kernel);
+        auto policy = make_policy(kernel);
         kernel <<<policy.grid, policy.block>>> (std::forward<Args>(args)...);
     }
 

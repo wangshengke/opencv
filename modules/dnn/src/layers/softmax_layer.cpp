@@ -311,7 +311,7 @@ public:
             auto output = output_wrapper->getSpan();
 
             auto actual_dims = input_wrapper->getShape().size();
-            CV_Assert(csl::tensor_utils::get_effective_rank(input) <= actual_dims);
+            CV_Assert(get_effective_rank(input) <= actual_dims);
 
             auto extra_dims = input.rank - actual_dims;
             auto instance_axis = clamp(axisRaw, actual_dims) + extra_dims;
