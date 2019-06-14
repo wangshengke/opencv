@@ -455,12 +455,15 @@ public:
             CV_Assert(input_size == weightsTensor.get_axis_size(-1));
             CV_Assert(output_size == weightsTensor.get_axis_size(-2));
 
+            input.reshape(batch_size, 1, input_size, 1);
+            output.reshape(batch_size, 1, output_size, 1);
+
+            csl::tensor_ops::multiply<float>(cublasHandle, output, weightsTensor, input);
+
             for (std::size_t j = 0; j < batch_size; j++)
             {
                 auto sample_input = input.subview(j * input_size, input_size, 1);
                 auto sample_output = output.subspan(j * output_size, output_size, 1);
-
-                csl::tensor_ops::multiply<float>(cublasHandle, sample_output, weightsTensor, sample_input);
 
                 if (bias)
                     csl::tensor_ops::add<float>(cublasHandle, sample_output, biasTensor, sample_output);

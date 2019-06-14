@@ -227,4 +227,87 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace cu
         );
     }
 
+    template <>
+    void gemmStridedBatched<float>(Handle handle,
+        bool transa, bool transb,
+        std::size_t rows_c, std::size_t cols_c, std::size_t common_dim,
+        float alpha, const DevicePtr<const float> A, std::size_t lda, std::size_t strideA,
+        const DevicePtr<const float> B, std::size_t ldb, std::size_t strideB,
+        float beta, const DevicePtr<float> C, std::size_t ldc, std::size_t strideC,
+        std::size_t batchCount)
+    {
+        CV_Assert(handle);
+        CV_Assert(transa == false && transb == false); /* other options unsupported yet */
+
+        auto opa = transa ? CUBLAS_OP_T : CUBLAS_OP_N,
+            opb = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+        auto irows_c = static_cast<int>(rows_c),
+            icols_c = static_cast<int>(cols_c),
+            icommon_dim = static_cast<int>(common_dim),
+            ilda = static_cast<int>(lda),
+            ildb = static_cast<int>(ldb),
+            ildc = static_cast<int>(ldc);
+
+        auto batch_count = static_cast<int>(batchCount);
+        auto stride_a = static_cast<long long int>(strideA),
+             stride_b = static_cast<long long int>(strideB),
+             stride_c = static_cast<long long int>(strideC);
+
+        if (!transa && !transb) {
+            CUDA4DNN_CHECK_CUBLAS(
+                cublasSgemmStridedBatched(
+                    HandleAccessor::get(handle),
+                    opb, opa,
+                    irows_c, icols_c, icommon_dim,
+                    &alpha, B.get(), ildb, stride_b,
+                    A.get(), ilda, stride_a,
+                    &beta, C.get(), ildc, stride_c,
+                    batch_count
+                )
+            );
+        }
+    }
+
+    template <>
+    void gemmStridedBatched<double>(Handle handle,
+        bool transa, bool transb,
+        std::size_t rows_c, std::size_t cols_c, std::size_t common_dim,
+        double alpha, const DevicePtr<const double> A, std::size_t lda, std::size_t strideA,
+        const DevicePtr<const double> B, std::size_t ldb, std::size_t strideB,
+        double beta, const DevicePtr<double> C, std::size_t ldc, std::size_t strideC,
+        std::size_t batchCount)
+    {
+        CV_Assert(handle);
+        CV_Assert(transa == false && transb == false); /* other options unsupported yet */
+
+        auto opa = transa ? CUBLAS_OP_T : CUBLAS_OP_N,
+            opb = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+        auto irows_c = static_cast<int>(rows_c),
+            icols_c = static_cast<int>(cols_c),
+            icommon_dim = static_cast<int>(common_dim),
+            ilda = static_cast<int>(lda),
+            ildb = static_cast<int>(ldb),
+            ildc = static_cast<int>(ldc);
+
+        auto batch_count = static_cast<int>(batchCount);
+        auto stride_a = static_cast<long long int>(strideA),
+            stride_b = static_cast<long long int>(strideB),
+            stride_c = static_cast<long long int>(strideC);
+
+        if (!transa && !transb) {
+            CUDA4DNN_CHECK_CUBLAS(
+                cublasDgemmStridedBatched(
+                    HandleAccessor::get(handle),
+                    opb, opa,
+                    irows_c, icols_c, icommon_dim,
+                    &alpha, B.get(), ildb, stride_a,
+                    A.get(), ilda, stride_b,
+                    &beta, C.get(), ildc, stride_c,
+                    batch_count
+                )
+            );
+        }
+    }
+
+
 }}}}} /* namespace cv::dnn::cuda4dnn::csl::cublas */

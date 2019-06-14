@@ -660,15 +660,12 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
          */
         template <class T> inline
         void multiply(const cublas::Handle& handle, TensorSpan<T> result, TensorView<T> A, TensorView<T> B) {
-            /* matrix operations can be performed only on rank two tensors */
-            CV_Assert(get_effective_rank(A) == 2 &&
-                      get_effective_rank(B) == 2 &&
-                      get_effective_rank(result) == 2);
-
             /* check dimension requirements for matrix multiplication */
             CV_Assert(A.get_axis_size(-2) == result.get_axis_size(-2));
             CV_Assert(A.get_axis_size(-1) == B.get_axis_size(-2));
             CV_Assert(B.get_axis_size(-1) == result.get_axis_size(-1));
+
+            auto batch_size = std::max({ A.get_axis_size(0), B.get_axis_size(0), result.get_axis_size(0) });
 
             const auto dest_nr = result.get_axis_size(-2);
             const auto dest_nc = result.get_axis_size(-1);
@@ -676,12 +673,45 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             const auto B_nr = B.get_axis_size(-2);
             const auto B_nc = B.get_axis_size(-1);
 
-            cublas::gemm<T>(handle,
-                false, false,
-                dest_nc, dest_nr, B_nr,
-                1.0, A.get(), A_nc,
-                B.get(), B_nc,
-                0.0, result.get(), dest_nc);
+            if (batch_size == 1) {
+                /* matrix operations can be performed only on rank two tensors */
+                CV_Assert(get_effective_rank(A) == 2 &&
+                    get_effective_rank(B) == 2 &&
+                    get_effective_rank(result) == 2);
+
+                cublas::gemm<T>(handle,
+                    false, false,
+                    dest_nc, dest_nr, B_nr,
+                    1.0, A.get(), A_nc,
+                    B.get(), B_nc,
+                    0.0, result.get(), dest_nc);
+            } else {
+                /* we need to consider the case where one or more of the operands is common for all batch items
+                 * in these cases, the stride for the operand matrix must be zero
+                 */
+                std::size_t strideA = (A.size() / batch_size),
+                            strideB = (B.size() / batch_size),
+                            strideC = (result.size() / batch_size);
+                if (batch_size != A.get_axis_size(0)) {
+                    strideA = 0;
+                    CV_Assert(A.get_axis_size(0) == 1); /* a different batch size doesn't make sense */
+                }
+
+                if (batch_size != B.get_axis_size(0)) {
+                    strideB = 0;
+                    CV_Assert(B.get_axis_size(0) == 1); /* a different batch size doesn't make sense */
+                }
+
+                CV_Assert(result.get_axis_size(0) == batch_size);
+
+                cublas::gemmStridedBatched<T>(handle,
+                    false, false,
+                    dest_nc, dest_nr, B_nr,
+                    1.0, A.get(), A_nc, strideA,
+                    B.get(), B_nc, strideB,
+                    0.0, result.get(), dest_nc, strideC,
+                    batch_size);
+            }
         }
 
         /** @brief performs matrix-addition
