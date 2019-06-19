@@ -245,7 +245,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         }
 
         /* returns the total number of elements in the span */
-        CUDA4DNN_HOST_DEVICE size_type size() const noexcept {
+        CUDA4DNN_HOST/*_DEVICE*/ size_type size() const noexcept {
             return std::accumulate(std::begin(sizes), std::end(sizes), 1, std::multiplies<size_type>());
         }
 
@@ -454,7 +454,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         }
 
         /* returns the total number of elements in the view */
-        CUDA4DNN_HOST_DEVICE size_type size() const noexcept {
+        CUDA4DNN_HOST/*_DEVICE*/ size_type size() const noexcept {
             return std::accumulate(std::begin(sizes), std::end(sizes), 1, std::multiplies<size_type>());
         }
 
@@ -648,8 +648,16 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         return effective_rank;
     }
 
-    namespace tensor_ops {
+    template <class TensorType> inline
+    std::vector<typename TensorType::size_type> get_shape_vector(const TensorType& x)  {
+        constexpr auto rank = TensorType::rank;
+        std::vector<typename TensorType::size_type> shape(rank);
+        for (int i = 0; i < rank; i++)
+            shape[i] = x.get_axis_size(i);
+        return shape;
+    }
 
+    namespace tensor_ops {
         /** @brief performs matrix-multplication
          *
          * Pre-conditions:
