@@ -42,6 +42,12 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
+
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/csl/tensor.hpp"
+using namespace cv::dnn::cuda4dnn;
+#endif
 
 namespace cv
 {
@@ -78,6 +84,12 @@ public:
         return false;
     }
 
+    bool supportBackend(int backendId) CV_OVERRIDE
+    {
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA());
+    }
+
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
@@ -92,6 +104,42 @@ public:
             inputs[0].copyTo(outputs[i]);
         }
     }
+
+#ifdef HAVE_CUDA
+    void forwardCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace
+    )
+    {
+        CV_UNUSED(workspace);
+
+        auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapperFP32>();
+        auto input = input_wrapper->getView();
+
+        for (std::size_t i = 0; i < outputs.size(); i++)
+        {
+            auto output_wrapper = outputs[i].dynamicCast<CUDABackendWrapperFP32>();
+            auto output = output_wrapper->getSpan();
+
+            if (input.get() != output.get())
+                csl::tensor_ops::copy(stream, output, input);
+        }
+    }
+
+    void initCUDA(
+        csl::Stream stream_,
+        csl::cublas::Handle cublas_handle,
+        csl::cudnn::Handle cudnn_handle,
+        std::size_t& scratch_mem_in_bytes
+    )
+    {
+        stream = std::move(stream_);
+    }
+
+    csl::Stream stream;
+#endif
+
 };
 
 Ptr<SplitLayer> SplitLayer::create(const LayerParams& params)
