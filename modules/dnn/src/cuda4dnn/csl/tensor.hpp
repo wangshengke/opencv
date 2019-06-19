@@ -658,6 +658,20 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
     }
 
     namespace tensor_ops {
+        /** @brief copies data between tensors
+         *
+         * Pre-conditions:
+         * - \p dest and \p src must have the same shape
+         *
+         * Exception Gaurantee: Basic
+         */
+        template <class T> inline
+        void copy(const Stream& stream, TensorSpan<T> dest, TensorView<T> src) {
+            CV_Assert(is_same_shape(dest, src));
+            if(dest.get() != src.get())
+                memcpy(dest.get(), src.get(), dest.size());
+        }
+
         /** @brief performs matrix-multplication
          *
          * Pre-conditions:
