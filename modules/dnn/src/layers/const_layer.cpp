@@ -7,9 +7,15 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "op_cuda.hpp"
 
 #ifdef HAVE_OPENCL
 #include "opencl_kernels_dnn.hpp"
+#endif
+
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/csl/tensor.hpp"
+using namespace cv::dnn::cuda4dnn;
 #endif
 
 namespace cv { namespace dnn {
@@ -31,6 +37,12 @@ public:
         CV_Assert(inputs.empty());
         outputs.assign(1, shape(blobs[0]));
         return false;
+    }
+
+    virtual bool supportBackend(int backendId) CV_OVERRIDE
+    {
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && haveCUDA());
     }
 
 #ifdef HAVE_OPENCL
@@ -58,6 +70,36 @@ public:
         outputs_arr.getMatVector(outputs);
         blobs[0].copyTo(outputs[0]);
     }
+
+#ifdef HAVE_CUDA
+    void forwardCUDA(
+        std::vector<cv::Ptr<BackendWrapper>>& inputs,
+        std::vector<cv::Ptr<BackendWrapper>>& outputs,
+        csl::Workspace& workspace
+    )
+    {
+        CV_UNUSED(workspace);
+
+        auto output_wrapper = outputs[0].dynamicCast<CUDABackendWrapperFP32>();
+        csl::tensor_ops::copy<float>(stream, output_wrapper->getSpan(), constTensor);
+    }
+
+    void initCUDA(
+        csl::Stream stream_,
+        csl::cublas::Handle cublas_handle,
+        csl::cudnn::Handle cudnn_handle,
+        std::size_t& scratch_mem_in_bytes
+    )
+    {
+        stream = std::move(stream_);
+        constTensor = createTensorHeaderFromMat(blobs[0]);
+        copyMatToTensor(constTensor, blobs[0], stream);
+    }
+
+    csl::Stream stream;
+    csl::Tensor<float> constTensor;
+#endif
+
 };
 
 Ptr<Layer> ConstLayer::create(const LayerParams& params)
