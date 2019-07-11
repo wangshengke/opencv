@@ -1309,17 +1309,21 @@ public:
 
         convoluter.convolve(output, input, filtersTensor, workspace);
         if (hasBias() || fusedBias)
-            csl::tensor_ops::add<float>(cudnnHandle, 1.0, output, 1.0, biasTensor);
+        {
+            std::size_t inner_size = total(output_wrapper->getShape(), 2, -1);
+            csl::kernels::biasN<float>(stream, output, output, inner_size, biasTensor);
+        }
     }
 
     void initCUDA(
-        csl::Stream stream,
+        csl::Stream stream_,
         csl::cublas::Handle cublas_handle,
         csl::cudnn::Handle cudnn_handle,
         std::size_t& scratch_mem_in_bytes,
         const std::vector<Ptr<BackendWrapper>>& inputs
     ) override
     {
+        stream = std::move(stream_);
         cudnnHandle = std::move(cudnn_handle);
 
         auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapperFP32>();
@@ -1428,6 +1432,7 @@ public:
         scratch_mem_in_bytes = convoluter.get_workspace_size();
     }
 
+    csl::Stream stream;
     csl::cudnn::Handle cudnnHandle;
     csl::Tensor<float> filtersTensor, biasTensor;
     csl::Convolution<float> convoluter;
@@ -2069,17 +2074,21 @@ public:
 
         convoluter.transpose_convolve(output, input, filtersTensor, workspace);
         if (hasBias() || fusedBias)
-            csl::tensor_ops::add<float>(cudnnHandle, 1.0, output, 1.0, biasTensor);
+        {
+            std::size_t inner_size = total(output_wrapper->getShape(), 2, -1);
+            csl::kernels::biasN<float>(stream, output, output, inner_size, biasTensor);
+        }
     }
 
     void initCUDA(
-        csl::Stream stream,
+        csl::Stream stream_,
         csl::cublas::Handle cublas_handle,
         csl::cudnn::Handle cudnn_handle,
         std::size_t& scratch_mem_in_bytes,
         const std::vector<Ptr<BackendWrapper>>& inputs
     ) override
     {
+        stream = std::move(stream_);
         cudnnHandle = std::move(cudnn_handle);
 
         auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapperFP32>();
@@ -2207,6 +2216,7 @@ public:
         scratch_mem_in_bytes = convoluter.get_workspace_size();
     }
 
+    csl::Stream stream;
     csl::cudnn::Handle cudnnHandle;
     csl::Tensor<float> filtersTensor, biasTensor;
     csl::TransposeConvolution<float> convoluter;
