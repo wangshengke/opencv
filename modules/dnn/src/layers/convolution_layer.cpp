@@ -2072,12 +2072,7 @@ public:
         config.groups = groups;
 
         CV_Assert(blobs.size() >= 1);
-        Mat filtersMat = blobs[0];
-        if (fusedWeights)
-        {
-            filtersMat = weightsMat.clone();
-            transpose(weightsMat, filtersMat);
-        }
+        Mat filtersMat = fusedWeights ? weightsMat.t() : blobs[0];
 
         Mat biasMat = (hasBias() || fusedBias) ? biasesMat : Mat();
         if (countNonZero(biasMat) == 0)
