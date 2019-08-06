@@ -1295,20 +1295,10 @@ public:
     }
 
 #ifdef HAVE_CUDA
-    void forwardCUDA(
-        std::vector<cv::Ptr<BackendWrapper>>& inputs,
-        std::vector<cv::Ptr<BackendWrapper>>& outputs,
-        csl::Workspace& workspace
-    ) override
-    {
-        cudaNode->forward(inputs, outputs, workspace);
-    }
-
-    void initCUDA(
+    Ptr<BackendNode> initCUDA(
         csl::Stream stream,
         csl::cublas::Handle cublas_handle,
         csl::cudnn::Handle cudnn_handle,
-        std::size_t& scratch_mem_in_bytes,
         const std::vector<Ptr<BackendWrapper>>& inputs
     ) override
     {
@@ -1374,13 +1364,9 @@ public:
         if (countNonZero(biasMat) == 0)
             biasMat = Mat();
 
-        cudaNode = make_cuda_node<cuda4dnn::ConvolutionOp>(
+        return make_cuda_node<cuda4dnn::ConvolutionOp>(
             preferableTarget, std::move(stream), std::move(cudnn_handle), config, filtersMat, biasMat);
-
-        scratch_mem_in_bytes = cudaNode->get_workspace_memory_in_bytes();
     }
-
-    std::unique_ptr<CUDABackendNode> cudaNode;
 #endif
 
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
@@ -2011,20 +1997,10 @@ public:
     }
 
 #ifdef HAVE_CUDA
-    void forwardCUDA(
-        std::vector<cv::Ptr<BackendWrapper>>& inputs,
-        std::vector<cv::Ptr<BackendWrapper>>& outputs,
-        csl::Workspace& workspace
-    ) override
-    {
-        cudaNode->forward(inputs, outputs, workspace);
-    }
-
-    void initCUDA(
+    Ptr<BackendNode> initCUDA(
         csl::Stream stream,
         csl::cublas::Handle cublas_handle,
         csl::cudnn::Handle cudnn_handle,
-        std::size_t& scratch_mem_in_bytes,
         const std::vector<Ptr<BackendWrapper>>& inputs
     ) override
     {
@@ -2098,13 +2074,9 @@ public:
         if (countNonZero(biasMat) == 0)
             biasMat = Mat();
 
-        cudaNode = make_cuda_node<cuda4dnn::TransposeConvolutionOp>(
+        return make_cuda_node<cuda4dnn::TransposeConvolutionOp>(
             preferableTarget, std::move(stream), std::move(cudnn_handle), config, filtersMat, biasMat);
-
-        scratch_mem_in_bytes = cudaNode->get_workspace_memory_in_bytes();
     }
-
-    std::unique_ptr<CUDABackendNode> cudaNode;
 #endif
 
     virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
