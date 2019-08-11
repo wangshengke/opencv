@@ -2507,10 +2507,12 @@ struct Net::Impl
                 {
                     CV_Assert(haveCUDA());
 
+#ifdef HAVE_CUDA
                     Ptr<CUDABackendNode> cudaNode = node.dynamicCast<CUDABackendNode>();
                     CV_Assert(!cudaNode.empty());
 
                     cudaNode->forward(ld.inputBlobsWrappers, ld.outputBlobsWrappers, workspace);
+#endif
                 }
                 else if (preferableBackend == DNN_BACKEND_HALIDE)
                 {
