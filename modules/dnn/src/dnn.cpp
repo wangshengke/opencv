@@ -46,9 +46,12 @@
 #include "op_cuda.hpp"
 #include "halide_scheduler.hpp"
 
-#include <opencv2/dnn/csl/stream.hpp>
-#include <opencv2/dnn/csl/cudnn.hpp>
-#include <opencv2/dnn/csl/cublas.hpp>
+#ifdef HAVE_CUDA
+#include "cuda4dnn/csl/stream.hpp"
+#include "cuda4dnn/csl/event.hpp"
+#include "cuda4dnn/csl/cudnn.hpp"
+#include "cuda4dnn/csl/cublas.hpp"
+#endif
 
 #include <set>
 #include <algorithm>
@@ -57,6 +60,8 @@
 #include <fstream>
 #include <iterator>
 #include <numeric>
+#include <map>
+#include <stack>
 #include <opencv2/dnn/shape_utils.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -1100,6 +1105,14 @@ struct Net::Impl
     cuda4dnn::csl::cudnn::Handle cudnnHandle;
     cuda4dnn::csl::Workspace workspace;
 
+    std::vector<std::vector<int>> graph_inputs;
+    std::vector<std::vector<int>> graph_outputs;
+
+    std::map<int, cuda4dnn::csl::Stream> sub_streams;
+    std::map<int, cuda4dnn::csl::cublas::Handle> sub_cublasHandle;
+    std::map<int, cuda4dnn::csl::cudnn::Handle> sub_cudnnHandle;
+    std::map<int, cuda4dnn::csl::Event> events;
+
     cv::AsyncPromise cudaAsyncPromise;
 #endif
 
@@ -1805,6 +1818,91 @@ struct Net::Impl
     void initCUDABackend() {
         CV_Assert(haveCUDA());
 
+        /* we construct a graph to perform several high level optimizations
+         * - execute kernels concurrently which can lead to maximal utilization of GPU resources
+         * - this also help cover up the otherwise idle GPU time between kernel launches
+         */
+
+         /* graph_inputs[i][j] => node `i` takes inputs from node `j`
+          * graph_outputs[i][j] => node `i` provides inputs for node `j`
+          */
+
+        std::vector<int> skip; /* ids of layers that are skipped */
+
+        auto total_layers = layers.size();
+        graph_inputs.resize(total_layers);
+        graph_outputs.resize(total_layers);
+
+        for (auto& layer : layers)
+        {
+            auto& ld = layer.second;
+            if (ld.skip)
+            {
+                skip.push_back(ld.id);
+                continue;
+            }
+
+            auto current_id = ld.id;
+            for (auto pin : ld.inputBlobsId)
+            {
+                auto parent_id = pin.lid;
+                if (std::count(std::begin(skip), std::end(skip), parent_id))
+                    continue;
+
+                graph_inputs[current_id].push_back(parent_id);
+                graph_outputs[parent_id].push_back(current_id);
+            }
+        }
+
+        /* we need to traverse the graph in a topologically sorted order */
+        const std::vector<int> sorting = [&] {
+            std::vector<bool> visited(total_layers, false);
+            std::stack<int> stack;
+
+            std::function<void(int)> visit;
+            visit = [&](int current) {
+                visited[current] = true;
+                for (auto child : graph_outputs[current])
+                    if (!visited[child])
+                        visit(child);
+                stack.push(current);
+            };
+
+            for (int i = 0; i < graph_outputs.size(); i++)
+                if (visited[i] == false)
+                    visit(i);
+
+            std::vector<int> sorting;
+            while (!stack.empty()) {
+                auto cur = stack.top();
+                stack.pop();
+                if (std::count(std::begin(skip), std::end(skip), cur))
+                    continue;
+                sorting.push_back(cur);
+            }
+
+            return sorting; /* RVO */
+        } ();
+
+        /*std::cout << "Topological Sorting:\n";
+        for (auto id : sorting) {
+            std::cout << '[' << id << ']' << layers[id].type << ' ' << layers[id].name << std::endl;
+        }
+
+        std::cout << "Skipped Layers:\n";
+        for (auto id : skip) {
+            std::cout << '[' << id << ']' << layers[id].type << ' ' << layers[id].name << std::endl;
+        }*/
+
+        for (auto id : sorting)
+        {
+            sub_streams[id] = cuda4dnn::csl::Stream(true);
+            sub_cublasHandle[id] = cuda4dnn::csl::cublas::Handle(sub_streams[id]);
+            sub_cudnnHandle[id] = cuda4dnn::csl::cudnn::Handle(sub_streams[id]);
+
+            events[id] = cuda4dnn::csl::Event(true);
+        }
+
 #ifdef HAVE_CUDA
         for (auto& layer : layers)
         {
@@ -1820,12 +1918,21 @@ struct Net::Impl
                 continue;
             }
 
-            auto node = layerInstance->initCUDA(stream, cublasHandle, cudnnHandle, ld.inputBlobsWrappers);
+            auto id = ld.id;
+            auto node = layerInstance->initCUDA(
+                sub_streams[id],
+                sub_cublasHandle[id],
+                sub_cudnnHandle[id], ld.inputBlobsWrappers);
+            events[id].record(sub_streams[id]);
+            cuda4dnn::csl::StreamWaitOnEvent(stream, events[id]);
+
             ld.backendNodes[DNN_BACKEND_CUDA] = node;
 
             auto cudaNode = node.dynamicCast<CUDABackendNode>();
             workspace.require(cudaNode->get_workspace_memory_in_bytes());
         }
+
+        stream.synchronize();
 #endif
     }
 
@@ -2513,7 +2620,17 @@ struct Net::Impl
                     Ptr<CUDABackendNode> cudaNode = node.dynamicCast<CUDABackendNode>();
                     CV_Assert(!cudaNode.empty());
 
+                    auto id = ld.id;
+                    for (auto parent : graph_inputs[id])
+                        if(events[parent])
+                            cuda4dnn::csl::StreamWaitOnEvent(sub_streams[id], events[parent]);
+
                     cudaNode->forward(ld.inputBlobsWrappers, ld.outputBlobsWrappers, workspace);
+
+                    if(sub_streams[id] && events[id])
+                        events[id].record(sub_streams[id]);
+                    if(events[id])
+                        cuda4dnn::csl::StreamWaitOnEvent(stream, events[id]);
 #endif
                 }
                 else if (preferableBackend == DNN_BACKEND_HALIDE)
