@@ -1296,12 +1296,13 @@ public:
 
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
-        csl::Stream stream,
-        csl::cublas::Handle cublas_handle,
-        csl::cudnn::Handle cudnn_handle,
-        const std::vector<Ptr<BackendWrapper>>& inputs
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
     ) override
     {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
         CV_Assert(inputs.size() == 1);
 
         auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
@@ -1365,7 +1366,7 @@ public:
             biasMat = Mat();
 
         return make_cuda_node<cuda4dnn::ConvolutionOp>(
-            preferableTarget, std::move(stream), std::move(cudnn_handle), config, filtersMat, biasMat);
+            preferableTarget, std::move(context->stream), std::move(context->cudnn_handle), config, filtersMat, biasMat);
     }
 #endif
 
@@ -1998,12 +1999,13 @@ public:
 
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
-        csl::Stream stream,
-        csl::cublas::Handle cublas_handle,
-        csl::cudnn::Handle cudnn_handle,
-        const std::vector<Ptr<BackendWrapper>>& inputs
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
     ) override
     {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
         CV_Assert(inputs.size() == 1);
 
         auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
@@ -2075,7 +2077,7 @@ public:
             biasMat = Mat();
 
         return make_cuda_node<cuda4dnn::TransposeConvolutionOp>(
-            preferableTarget, std::move(stream), std::move(cudnn_handle), config, filtersMat, biasMat);
+            preferableTarget, std::move(context->stream), std::move(context->cudnn_handle), config, filtersMat, biasMat);
     }
 #endif
 
