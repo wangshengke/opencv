@@ -46,6 +46,10 @@
 #include "op_cuda.hpp"
 #include "halide_scheduler.hpp"
 
+#ifdef HAVE_CUDA
+#include "cuda4dnn/csl/nvtx.hpp"
+#endif
+
 #include <set>
 #include <algorithm>
 #include <iostream>
@@ -1919,7 +1923,7 @@ struct Net::Impl
             }
 #endif
         }
-        
+
         /* CUDA backend has its own system for internal blobs; we don't need these */
         ld.internalBlobsWrappers.resize((preferableBackend == DNN_BACKEND_CUDA) ? 0 : ld.internals.size());
         for (int i = 0; i < ld.internalBlobsWrappers.size(); ++i)
@@ -2525,6 +2529,8 @@ struct Net::Impl
                     Ptr<CUDABackendNode> cudaNode = node.dynamicCast<CUDABackendNode>();
                     CV_Assert(!cudaNode.empty());
 
+                    auto info = "forwarding [" + ld.type + "] " + ld.name;
+                    cuda4dnn::csl::nvtx::Range marker(info.c_str());
                     cudaNode->forward(ld.inputBlobsWrappers, ld.outputBlobsWrappers, workspace);
 #endif
                 }
