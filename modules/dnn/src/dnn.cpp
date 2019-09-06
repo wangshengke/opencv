@@ -47,6 +47,8 @@
 #include "halide_scheduler.hpp"
 
 #ifdef HAVE_CUDA
+#include "cuda4dnn/csl/stream.hpp"
+#include "cuda4dnn/csl/event.hpp"
 #include "cuda4dnn/csl/nvtx.hpp"
 #endif
 
@@ -1101,6 +1103,9 @@ struct Net::Impl
     cuda4dnn::csl::cudnn::Handle cudnnHandle;
     cuda4dnn::csl::Workspace workspace;
 
+    std::vector<cuda4dnn::csl::Event> cudaLayerEventStart;
+    std::vector<cuda4dnn::csl::Event> cudaLayerEventEnd;
+
     cv::AsyncPromise cudaAsyncPromise;
 #endif
 
@@ -1807,6 +1812,9 @@ struct Net::Impl
         CV_Assert(haveCUDA());
 
 #ifdef HAVE_CUDA
+        cudaLayerEventStart.resize(layers.size());
+        cudaLayerEventEnd.resize(layers.size());
+
         for (auto& layer : layers)
         {
             auto& ld = layer.second;
@@ -1816,7 +1824,7 @@ struct Net::Impl
             {
                 std::ostringstream os;
                 os << "CUDA backend will fallback to the CPU implementation for the layer \"" << ld.name
-                   << "\" of type " << ld.type << '\n';
+                    << "\" of type " << ld.type << '\n';
                 CV_LOG_INFO(NULL, os.str().c_str());
                 continue;
             }
@@ -1831,6 +1839,9 @@ struct Net::Impl
 
             auto cudaNode = node.dynamicCast<CUDABackendNode>();
             workspace.require(cudaNode->get_workspace_memory_in_bytes());
+
+            cudaLayerEventStart[ld.id] = cuda4dnn::csl::Event(true, true);
+            cudaLayerEventEnd[ld.id] = cuda4dnn::csl::Event(true, true);
         }
 #endif
     }
@@ -2531,7 +2542,10 @@ struct Net::Impl
 
                     auto info = "forwarding [" + ld.type + "] " + ld.name;
                     cuda4dnn::csl::nvtx::Range marker(info.c_str());
+
+                    cudaLayerEventStart[ld.id].record(stream);
                     cudaNode->forward(ld.inputBlobsWrappers, ld.outputBlobsWrappers, workspace);
+                    cudaLayerEventEnd[ld.id].record(stream);
 #endif
                 }
                 else if (preferableBackend == DNN_BACKEND_HALIDE)
@@ -3696,7 +3710,39 @@ void Net::setHalideScheduler(const String& scheduler)
 
 int64 Net::getPerfProfile(std::vector<double>& timings)
 {
-    timings = std::vector<double>(impl->layersTimings.begin() + 1, impl->layersTimings.end());
+    if (impl->preferableBackend == DNN_BACKEND_CUDA)
+    {
+        timings = std::vector<double>(impl->layersTimings.begin() + 1, impl->layersTimings.end());
+        for (auto& layer : impl->layers)
+        {
+            auto& ld = layer.second;
+            if (ld.id == 0)
+                continue;
+
+            if (ld.skip)
+            {
+                timings[ld.id - 1] = 0;
+                continue;
+            }
+
+            if (ld.backendNodes.count(DNN_BACKEND_CUDA))
+            {
+                auto& start = impl->cudaLayerEventStart[ld.id];
+                auto& end = impl->cudaLayerEventEnd[ld.id];
+                auto time = cuda4dnn::csl::TimeElapsedBetweenEvents(start, end) / 1000 * getTickFrequency();
+                timings[ld.id - 1] = time;
+            }
+            else
+            {
+                timings[ld.id - 1] = impl->layersTimings[ld.id];
+            }
+        }
+    }
+    else
+    {
+        timings = std::vector<double>(impl->layersTimings.begin() + 1, impl->layersTimings.end());
+    }
+
     int64 total = (int64)std::accumulate(timings.begin(), timings.end(), 0.0);
     return total;
 }
