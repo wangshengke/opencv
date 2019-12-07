@@ -163,6 +163,8 @@ namespace cv { namespace dnn {
             const std::vector<cv::Ptr<BackendWrapper>>& outputs,
             cuda4dnn::csl::Workspace& workspace) = 0;
 
+        virtual void synchronize() { }
+
         virtual std::size_t get_workspace_memory_in_bytes() const noexcept { return 0; }
     };
 
@@ -207,9 +209,11 @@ namespace cv { namespace dnn {
         virtual ~CUDABackendWrapper() { }
 
         void copyToHost() override = 0;
+        virtual void copyToHost(cuda4dnn::csl::Stream&) = 0;
         void setHostDirty() override = 0;
 
         virtual void copyToDevice() = 0;
+        virtual void copyToDevice(cuda4dnn::csl::Stream&) = 0;
         virtual void setDeviceDirty() = 0;
 
         virtual MatShape getShape() const noexcept = 0;
@@ -289,6 +293,16 @@ namespace cv { namespace dnn {
             }
         }
 
+        void copyToHost(cuda4dnn::csl::Stream& stream) override {
+            if (shared_block->device_dirty) {
+                shared_block->host_dirty = false;
+                shared_block->device_dirty = false;
+
+                auto view = tensor_view_type(shared_block->device.get(), std::begin(shape), std::end(shape));
+                cuda4dnn::csl::copyTensorToMat<T>(view, shared_block->host, stream);
+            }
+        }
+
         void setHostDirty() override {
             shared_block->device_dirty = false;
             shared_block->host_dirty = true;
@@ -301,6 +315,16 @@ namespace cv { namespace dnn {
 
                 auto span = tensor_span_type(shared_block->device.get(), std::begin(shape), std::end(shape));
                 cuda4dnn::csl::copyMatToTensor<T>(shared_block->host, span, shared_block->stream);
+            }
+        }
+
+        void copyToDevice(cuda4dnn::csl::Stream& stream) override {
+            if (shared_block->host_dirty) {
+                shared_block->host_dirty = false;
+                shared_block->device_dirty = false;
+
+                auto span = tensor_span_type(shared_block->device.get(), std::begin(shape), std::end(shape));
+                cuda4dnn::csl::copyMatToTensor<T>(shared_block->host, span, stream);
             }
         }
 
@@ -325,6 +349,10 @@ namespace cv { namespace dnn {
 
         const cv::Mat getImmutableHostMat() const noexcept {
             copyToHost();
+            return shared_block->host;
+        }
+
+        const cv::Mat getHostMatReference() noexcept {
             return shared_block->host;
         }
 

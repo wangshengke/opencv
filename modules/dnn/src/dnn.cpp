@@ -2992,7 +2992,27 @@ struct Net::Impl
 
 #ifdef HAVE_CUDA
         if (preferableBackend == DNN_BACKEND_CUDA)
+        {
             cudaInfo->context.stream.synchronize();
+            for (it = layers.begin(); it != layers.end() && (it->second.id < ld.id); ++it)
+            {
+                auto it = ld.backendNodes.find(preferableBackend);
+                if(it != ld.backendNodes.end())
+                {
+                           Ptr<BackendNode> node = it->second;
+                    CV_Assert(!node.empty());
+                    if (preferableBackend == DNN_BACKEND_CUDA)
+                    {
+                        CV_Assert(haveCUDA());
+
+                        Ptr<CUDABackendNode> cudaNode = node.dynamicCast<CUDABackendNode>();
+                        CV_Assert(!cudaNode.empty());
+
+                        cudaNode->synchronize();
+                    }
+                }
+            }
+        }
 #endif
     }
 
