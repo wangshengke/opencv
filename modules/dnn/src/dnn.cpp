@@ -64,6 +64,7 @@
 
 #include <opencv2/core/cuda.hpp>
 
+#include <cuda_runtime.h>
 namespace cv {
 namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
@@ -1141,6 +1142,9 @@ struct Net::Impl
         CudaInfo_t(cuda4dnn::csl::CSLContext ctxt) : context(std::move(ctxt)) { }
         cuda4dnn::csl::CSLContext context;
         cuda4dnn::csl::Workspace workspace;
+
+        cudaGraph_t graph;
+        cudaGraphExec_t instance;
     };
 
     std::unique_ptr<CudaInfo_t> cudaInfo;
@@ -2191,6 +2195,7 @@ struct Net::Impl
         CV_Assert(haveCUDA());
 
 #ifdef HAVE_CUDA
+        bool no_fallback = true;
         for (auto& layer : layers)
         {
             auto& ld = layer.second;
@@ -2198,6 +2203,8 @@ struct Net::Impl
 
             if (!layerInstance->supportBackend(DNN_BACKEND_CUDA))
             {
+                if(ld.skip == false)
+                    no_fallback = false;
                 std::ostringstream os;
                 os << "CUDA backend will fallback to the CPU implementation for the layer \"" << ld.name
                    << "\" of type " << ld.type << '\n';
@@ -2213,6 +2220,70 @@ struct Net::Impl
             auto cudaNode = node.dynamicCast<CUDABackendNode>();
             cudaInfo->workspace.require(cudaNode->get_workspace_memory_in_bytes());
         }
+
+        using namespace cuda4dnn;
+
+        std::map<int, cudaGraphNode_t> nodes;
+        if (no_fallback)
+        {
+            //std::cout << "Constructing graph" << std::endl;
+            /* construct a CUDA graph for the network */
+            auto& graph = cudaInfo->graph;
+            CUDA4DNN_CHECK_CUDA(cudaGraphCreate(&graph, 0));
+            for (auto& layer : layers)
+            {
+                auto& ld = layer.second;
+                auto& backendNode = ld.backendNodes[DNN_BACKEND_CUDA];
+                auto cudaNode = backendNode.dynamicCast<CUDABackendNode>();
+                if(cudaNode.empty())
+                    continue;
+
+                std::cout << "Obtaining child graph for " << ld.type << std::endl;
+
+                auto child_graph = cudaNode->get_node(cudaInfo->context.stream, ld.inputBlobsWrappers, ld.outputBlobsWrappers, cudaInfo->workspace);
+                std::cout << "Obtained child graph for " << ld.type << std::endl;
+
+                cudaGraphNode_t node;
+                CUDA4DNN_CHECK_CUDA(cudaGraphAddChildGraphNode(&node, graph, nullptr, 0, child_graph));
+                std::cout << "\tcreated child node" << std::endl;
+
+                nodes[ld.id] = node;
+
+                auto ninputs = ld.inputBlobsId.size();
+                std::vector<int> layer_dependencies;
+                for(auto i = 0; i < ninputs; i++)
+                {
+                    LayerPin pin = ld.inputBlobsId[i];
+                    if(pin.lid == 0)
+                    {
+                        std::cout << "depends on Input layer\n";
+                        continue;
+                    }
+                    LayerData* inp_i_data = &layers[pin.lid];
+                    while(inp_i_data->skip)
+                    {
+                        pin = inp_i_data->inputBlobsId[0];
+                        inp_i_data = &layers[pin.lid];
+                    }
+
+                    std::cout << "\tdepends on layer " << pin.lid << std::endl;
+                    layer_dependencies.push_back(pin.lid);
+                }
+
+                for (auto i : layer_dependencies)
+                {
+                    CV_Assert(nodes.count(i) > 0);
+                    CUDA4DNN_CHECK_CUDA(cudaGraphAddDependencies(graph, &nodes[i], &node, 1));
+                }
+            }
+
+            cudaGraphNode_t errorNode;
+            auto& instance = cudaInfo->instance;
+
+            char msg[4096];
+            CUDA4DNN_CHECK_CUDA(cudaGraphInstantiate(&instance, graph, &errorNode, msg, 4096));
+        }
+
 #endif
     }
 
@@ -3323,7 +3394,27 @@ Mat Net::forward(const String& outputName)
 
     std::vector<LayerPin> pins(1, impl->getPinByAlias(layerName));
     impl->setUpNet(pins);
-    impl->forwardToLayer(impl->getLayerData(layerName));
+
+    if (impl->preferableBackend == DNN_BACKEND_CUDA)
+    {
+        auto& stream =  impl->cudaInfo->context.stream;
+        auto ld = impl->layers[0];
+        for(auto& wrapper_raw : ld.outputBlobsWrappers)
+        {
+            auto wrapper = wrapper_raw.dynamicCast<CUDABackendWrapper>();
+            wrapper->copyToDevice(stream);
+        }
+        impl->forwardToLayer(impl->getLayerData(layerName));
+
+        //CUDA4DNN_CHECK_CUDA(cudaGraphLaunch(impl->cudaInfo->instance, stream.get()));
+        auto pin = impl->resolvePinOutputName(impl->getLayerData(layerName), outputName);
+        ld.outputBlobsWrappers[pin]->copyToHost();
+        impl->cudaInfo->context.stream.synchronize();
+    }
+    else
+    {
+        impl->forwardToLayer(impl->getLayerData(layerName));
+    }
 
     return impl->getBlob(layerName);
 }

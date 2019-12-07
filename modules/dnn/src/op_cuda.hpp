@@ -7,6 +7,7 @@
 
 #ifdef HAVE_CUDA
 #include "cuda4dnn/csl/stream.hpp"
+#include "cuda4dnn/csl/graph.hpp"
 #include "cuda4dnn/csl/cublas.hpp"
 #include "cuda4dnn/csl/cudnn.hpp"
 #include "cuda4dnn/csl/tensor.hpp"
@@ -152,54 +153,6 @@ namespace cv { namespace dnn {
 
     }} /* namespace cuda4dnn::csl */
 
-    /** base class for CUDA operation nodes (for all supported targets) */
-    class CUDABackendNode : public BackendNode {
-    public:
-        CUDABackendNode() : BackendNode(DNN_BACKEND_CUDA) { }
-        virtual ~CUDABackendNode() { }
-
-        virtual void forward(
-            const std::vector<cv::Ptr<BackendWrapper>>& inputs,
-            const std::vector<cv::Ptr<BackendWrapper>>& outputs,
-            cuda4dnn::csl::Workspace& workspace) = 0;
-
-        virtual std::size_t get_workspace_memory_in_bytes() const noexcept { return 0; }
-    };
-
-    /** @brief utility function which creates CUDA node of correct type from `targetId`
-     *
-     * CUDA operation nodes take the type of data they operate on as a template parameter.
-     * For example, ConcatOp<float> is an operation node which concats tensors of `float` type
-     * into a tensor of `float` type.
-     *
-     * This utility function aids the creation of nodes of different types and eliminates the
-     * need for CUDA target constants (`DNN_TARGET_XXX`) to appear in the operation code which
-     * reduces coupling between modules.
-     *
-     * Example:
-     * template <class T>
-     * class ConcatOp : public CUDABackendNode;
-     *
-     * // returns a cv::Ptr to a ConcatOp<half> object
-     * auto node = make_cuda_node<ConcatOp>(DNN_TARGET_CUDA_FP16, axis);
-     *
-     * // returns a cv::Ptr to a ConcatOp<float> object
-     * auto node = make_cuda_node<ConcatOp>(DNN_TARGET_CUDA, axis);
-     */
-    template <template <class> class NodeType, class ...Args>
-    cv::Ptr<BackendNode> make_cuda_node(int targetId, Args&& ...args) {
-        switch (targetId)
-        {
-        case DNN_TARGET_CUDA_FP16:
-            return Ptr<BackendNode>(new NodeType<half>(std::forward<Args>(args)...));
-        case DNN_TARGET_CUDA:
-            return Ptr<BackendNode>(new NodeType<float>(std::forward<Args>(args)...));
-        default:
-            CV_Assert(IS_DNN_CUDA_TARGET(targetId));
-        }
-        return Ptr<BackendNode>();
-    }
-
     /* base class for all CUDA backend/target wrappers */
     class CUDABackendWrapper : public BackendWrapper {
     public:
@@ -207,10 +160,14 @@ namespace cv { namespace dnn {
         virtual ~CUDABackendWrapper() { }
 
         void copyToHost() override = 0;
+        virtual void copyToHost(const cuda4dnn::csl::Stream& stream) = 0;
         void setHostDirty() override = 0;
+        virtual bool isHostDirty() const noexcept = 0;
 
         virtual void copyToDevice() = 0;
+        virtual void copyToDevice(const cuda4dnn::csl::Stream& stream) =0;
         virtual void setDeviceDirty() = 0;
+        virtual bool isDeviceDirty() const noexcept = 0;
 
         virtual MatShape getShape() const noexcept = 0;
         virtual std::size_t getRank() const noexcept = 0;
@@ -289,9 +246,23 @@ namespace cv { namespace dnn {
             }
         }
 
+        void copyToHost(const cuda4dnn::csl::Stream& stream) override {
+            if (shared_block->device_dirty) {
+                shared_block->host_dirty = false;
+                shared_block->device_dirty = false;
+
+                auto view = tensor_view_type(shared_block->device.get(), std::begin(shape), std::end(shape));
+                cuda4dnn::csl::copyTensorToMat<T>(view, shared_block->host, stream);
+            }
+        }
+
         void setHostDirty() override {
             shared_block->device_dirty = false;
             shared_block->host_dirty = true;
+        }
+
+        bool isHostDirty() const noexcept override {
+            return shared_block->host_dirty;
         }
 
         void copyToDevice() override {
@@ -304,9 +275,23 @@ namespace cv { namespace dnn {
             }
         }
 
+        void copyToDevice(const cuda4dnn::csl::Stream& stream) override {
+            if (shared_block->host_dirty) {
+                shared_block->host_dirty = false;
+                shared_block->device_dirty = false;
+
+                auto span = tensor_span_type(shared_block->device.get(), std::begin(shape), std::end(shape));
+                cuda4dnn::csl::copyMatToTensor<T>(shared_block->host, span, stream);
+            }
+        }
+
         void setDeviceDirty() override {
             shared_block->device_dirty = true;
             shared_block->host_dirty = false;
+        }
+
+        bool isDeviceDirty() const noexcept override {
+            return shared_block->device_dirty;
         }
 
         MatShape getShape() const noexcept override { return shape; }
@@ -383,6 +368,86 @@ namespace cv { namespace dnn {
 
     template <class T>
     using GetCUDABackendWrapperType = typename GetCUDABackendWrapperType_<T>::type;
+
+    /** base class for CUDA operation nodes (for all supported targets) */
+    class CUDABackendNode : public BackendNode {
+    public:
+        CUDABackendNode() : BackendNode(DNN_BACKEND_CUDA) { }
+        virtual ~CUDABackendNode() { }
+
+        virtual void forward(
+            const std::vector<cv::Ptr<BackendWrapper>>& inputs,
+            const std::vector<cv::Ptr<BackendWrapper>>& outputs,
+            cuda4dnn::csl::Workspace& workspace) = 0;
+
+        /** generates a CUDA graph node for the backend node */
+        virtual cudaGraph_t get_node(
+            cuda4dnn::csl::Stream& stream,
+            const std::vector<cv::Ptr<BackendWrapper>>& inputs,
+            const std::vector<cv::Ptr<BackendWrapper>>& outputs,
+            cuda4dnn::csl::Workspace& workspace)
+        {
+            using namespace cuda4dnn::csl;
+
+            // Graph graph;
+
+            // /* perform any H2D copy if required */
+            // for (const auto& wrapper_raw : inputs) {
+            //     auto wrapper = wrapper_raw.dynamicCast<CUDABackendWrapper>();
+            //     CV_Assert(!wrapper.empty());
+
+            //     if (wrapper->isHostDirty()) {
+            //         GraphMemcpyNode node(graph);
+            //         //node.set_params(wrapper->)
+            //     }
+            // }
+
+            /* record kernel execution */
+            //Graph compGraph;
+            //compGraph.capture(stream, [&] { forward(inputs, outputs, workspace); });
+            cudaGraph_t graph;
+            CUDA4DNN_CHECK_CUDA(cudaStreamBeginCapture(stream.get(), cudaStreamCaptureModeThreadLocal));
+            forward(inputs, outputs, workspace);
+            CUDA4DNN_CHECK_CUDA(cudaStreamEndCapture(stream.get(), &graph));
+            return graph;
+        }
+
+        virtual std::size_t get_workspace_memory_in_bytes() const noexcept { return 0; }
+    };
+
+    /** @brief utility function which creates CUDA node of correct type from `targetId`
+     *
+     * CUDA operation nodes take the type of data they operate on as a template parameter.
+     * For example, ConcatOp<float> is an operation node which concats tensors of `float` type
+     * into a tensor of `float` type.
+     *
+     * This utility function aids the creation of nodes of different types and eliminates the
+     * need for CUDA target constants (`DNN_TARGET_XXX`) to appear in the operation code which
+     * reduces coupling between modules.
+     *
+     * Example:
+     * template <class T>
+     * class ConcatOp : public CUDABackendNode;
+     *
+     * // returns a cv::Ptr to a ConcatOp<half> object
+     * auto node = make_cuda_node<ConcatOp>(DNN_TARGET_CUDA_FP16, axis);
+     *
+     * // returns a cv::Ptr to a ConcatOp<float> object
+     * auto node = make_cuda_node<ConcatOp>(DNN_TARGET_CUDA, axis);
+     */
+    template <template <class> class NodeType, class ...Args>
+    cv::Ptr<BackendNode> make_cuda_node(int targetId, Args&& ...args) {
+        switch (targetId)
+        {
+        case DNN_TARGET_CUDA_FP16:
+            return Ptr<BackendNode>(new NodeType<half>(std::forward<Args>(args)...));
+        case DNN_TARGET_CUDA:
+            return Ptr<BackendNode>(new NodeType<float>(std::forward<Args>(args)...));
+        default:
+            CV_Assert(IS_DNN_CUDA_TARGET(targetId));
+        }
+        return Ptr<BackendNode>();
+    }
 
 #endif
 }} /* namespace cv::dnn */
