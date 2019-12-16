@@ -10,6 +10,7 @@
 #include "../csl/stream.hpp"
 #include "../csl/span.hpp"
 #include "../csl/tensor.hpp"
+#include "../csl/tensor_ops.hpp"
 
 #include "../kernels/prior_box.hpp"
 
@@ -46,29 +47,16 @@ namespace cv { namespace dnn { namespace cuda4dnn {
         using wrapper_type = GetCUDABackendWrapperType<T>;
 
         PriorBoxOp(csl::Stream stream_, const PriorBoxConfiguration& config)
-            : stream(std::move(stream_))
+            : stream(std::move(stream_)), prefer_cpu_over_gpu{false}, copied{false}
         {
-            feature_map_width = config.feature_map_width;
-            feature_map_height = config.feature_map_height;
-
-            image_width = config.image_width;
-            image_height = config.image_height;
-
             const auto& box_widths = config.box_widths;
             const auto& box_heights = config.box_heights;
             CV_Assert(box_widths.size() == box_heights.size());
-
-            box_size = box_widths.size();
 
             const auto& offsets_x = config.offsets_x;
             const auto& offsets_y = config.offsets_y;
             CV_Assert(offsets_x.size() == offsets_y.size());
 
-            offset_size = offsets_x.size();
-
-            /* for better memory utilization and preassumably better cache performance, we merge
-             * the four vectors and put them in a single tensor
-             */
             auto total = box_widths.size() * 2 + offsets_x.size() * 2;
             std::vector<float> merged_params;
             merged_params.insert(std::end(merged_params), std::begin(box_widths), std::end(box_widths));
@@ -77,17 +65,27 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             merged_params.insert(std::end(merged_params), std::begin(offsets_y), std::end(offsets_y));
             CV_Assert(merged_params.size() == total);
 
-            paramsTensor.resize(total);
+            csl::Tensor<float> paramsTensor(total); /* widths, heights, offsetsX, offsetsY */
             csl::memcpy(paramsTensor.get(), merged_params.data(), total, stream); /* synchronous copy */
 
-            const auto& variance_ = config.variance;
-            variance.assign(std::begin(variance_), std::end(variance_));
+            /* we had stored all the parameters in a single tensor; now we create appropriate views
+             * for each of the parameter arrays from the single tensor
+             */
+            auto box_size = box_widths.size(), offset_size = offsets_x.size();
+            auto boxWidths  = csl::View<float>(paramsTensor.get(), box_size);
+            auto boxHeights = csl::View<float>(paramsTensor.get() + box_size, box_size);
+            auto offsetsX   = csl::View<float>(paramsTensor.get() + 2 * box_size, offset_size);
+            auto offsetsY   = csl::View<float>(paramsTensor.get() + 2 * box_size + offset_size, offset_size);
 
-            num_priors = config.num_priors;
-            stepX = config.stepX;
-            stepY = config.stepY;
-            clip = config.clip;
-            normalize = config.normalize;
+            auto feature_map_width = config.feature_map_width;
+            auto feature_map_height = config.feature_map_height;
+            priors_gpu_precomp.resize(1, 2, feature_map_height * feature_map_width * config.num_priors * 4);
+
+            kernels::generate_prior_boxes<T>(stream, priors_gpu_precomp,
+                boxWidths, boxHeights, offsetsX, offsetsY, config.stepX, config.stepY,
+                config.variance, config.num_priors,
+                feature_map_width, feature_map_height,
+                config.image_width, config.image_height, config.normalize, config.clip);
         }
 
         void forward(
@@ -99,35 +97,66 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             CV_Assert(outputs.size() == 1);
 
             auto output_wrapper = outputs[0].dynamicCast<wrapper_type>();
-            auto output = output_wrapper->getSpan();
 
-            /* we had stored all the parameters in a single tensor; now we create appropriate views
-             * for each of the parameter arrays from the single tensor
-             */
-            auto boxWidths  = csl::View<float>(paramsTensor.get(), box_size);
-            auto boxHeights = csl::View<float>(paramsTensor.get() + box_size, box_size);
-            auto offsetsX   = csl::View<float>(paramsTensor.get() + 2 * box_size, offset_size);
-            auto offsetsY   = csl::View<float>(paramsTensor.get() + 2 * box_size + offset_size, offset_size);
+            if(prefer_cpu_over_gpu && !copied)
+            {
+                output_wrapper->setHostDirty();
+                auto output = output_wrapper->getMutableHostMat();
+                CV_Assert(output.isContinuous());
+                CV_Assert(priors_cpu_precomp.isContinuous());
+                priors_cpu_precomp.copyTo(output);
+                copied = true;
+            }
+            else
+            {
+                auto output = output_wrapper->getSpan();
+                csl::tensor_ops::copy<T>(stream, output, priors_gpu_precomp);
+            }
+        }
 
-            kernels::generate_prior_boxes<T>(stream, output,
-                boxWidths, boxHeights, offsetsX, offsetsY, stepX, stepY,
-                variance, num_priors, feature_map_width, feature_map_height, image_width, image_height, normalize, clip);
+        bool set_field(const std::string& key, const std::string& value) override
+        {
+            if (key == "output_location")
+            {
+                if (value == "cpu")
+                {
+                    std::vector<int> shape(3);
+                    shape[0] = 1;
+                    shape[1] = 2;
+                    shape[2] = priors_gpu_precomp.get_axis_size(2);
+                    priors_cpu_precomp = cv::Mat(shape, CV_32F);
+                    csl::copyTensorToMat<T>(priors_gpu_precomp, priors_cpu_precomp, stream);
+                    prefer_cpu_over_gpu = true;
+                    return true;
+                }
+                else if(value == "gpu")
+                {
+                    priors_cpu_precomp.release();
+                    prefer_cpu_over_gpu = false;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool get_field(const std::string& key, std::string& value) override
+        {
+            if (key == "name")
+            {
+                value = "PriorBox";
+                return true;
+            }
+            return false;
         }
 
     private:
         csl::Stream stream;
-        csl::Tensor<float> paramsTensor; /* widths, heights, offsetsX, offsetsY */
 
-        std::size_t feature_map_width, feature_map_height;
-        std::size_t image_width, image_height;
+        csl::Tensor<T> priors_gpu_precomp;
+        cv::Mat priors_cpu_precomp;
 
-        std::size_t box_size, offset_size;
-        float stepX, stepY;
-
-        std::vector<float> variance;
-
-        std::size_t num_priors;
-        bool clip, normalize;
+        bool prefer_cpu_over_gpu;
+        bool copied;
     };
 
 

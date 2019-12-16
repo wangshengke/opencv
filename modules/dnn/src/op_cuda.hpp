@@ -164,6 +164,9 @@ namespace cv { namespace dnn {
             cuda4dnn::csl::Workspace& workspace) = 0;
 
         virtual std::size_t get_workspace_memory_in_bytes() const noexcept { return 0; }
+
+        virtual bool get_field(const std::string& key, std::string& value) { return false; }
+        virtual bool set_field(const std::string& key, const std::string& value) { return false; }
     };
 
     /** @brief utility function which creates CUDA node of correct type from `targetId`

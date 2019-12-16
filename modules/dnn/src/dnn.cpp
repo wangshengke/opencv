@@ -2213,6 +2213,59 @@ struct Net::Impl
             auto cudaNode = node.dynamicCast<CUDABackendNode>();
             cudaInfo->workspace.require(cudaNode->get_workspace_memory_in_bytes());
         }
+
+        for (auto& layer : layers)
+        {
+            auto& ld = layer.second;
+            if (ld.backendNodes.count(DNN_BACKEND_CUDA) != 0)
+            {
+                auto cudaNode = ld.backendNodes[DNN_BACKEND_CUDA].dynamicCast<CUDABackendNode>();
+                std::string name;
+                if (cudaNode->get_field("name", name))
+                {
+                    /* PriorBoxOp does not require any inputs for computing the priors. The priors are precomputed
+                     * and copied to the output during forward pass. If there are no direct GPU consumers of the priors,
+                     * we can write the priors to the host cv::Mat and thereby avoid a device to host memory transfer.
+                     */
+                    if (name == "PriorBox")
+                    {
+                        bool cpu = true;
+                        for (int i = 0; i < ld.consumers.size(); ++i)
+                        {
+                            LayerData& consumer = layers[ld.consumers[i].lid];
+                            if (consumer.backendNodes.count(DNN_BACKEND_CUDA) != 0)
+                            {
+                                cpu = false;
+                                break;
+                            }
+                        }
+
+                        if(cpu)
+                        {
+                            auto fixed_mat = ld.outputBlobs[0].clone();
+                            ld.outputBlobsWrappers[0] = wrap(fixed_mat);
+                            ld.outputBlobs[0] = fixed_mat;
+
+                            for (int i = 0; i < ld.consumers.size(); ++i)
+                            {
+                                LayerData& consumer = layers[ld.consumers[i].lid];
+                                for (int j = 0; j < consumer.inputBlobsId.size(); ++j)
+                                {
+                                    if (consumer.inputBlobsId[j].lid == ld.id)
+                                    {
+                                        consumer.inputBlobs[j] = &ld.outputBlobs[0];
+                                        consumer.inputBlobsWrappers[j] = ld.outputBlobsWrappers[0];
+                                        break;
+                                    }
+                                }
+                            }
+
+                            cudaNode->set_field("output_location", "cpu");
+                        }
+                    }
+                }
+            }
+        }
 #endif
     }
 
