@@ -85,12 +85,12 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
     };
 
     /** makes a stream wait on an event */
-    void StreamWaitOnEvent(const Stream& stream, const Event& event) {
+    inline void StreamWaitOnEvent(const Stream& stream, const Event& event) {
         CUDA4DNN_CHECK_CUDA(cudaStreamWaitEvent(stream.get(), event.get(), 0));
     }
 
     /** returns the time elapsed between two events in milliseconds */
-    float TimeElapsedBetweenEvents(const Event& start, const Event& end) {
+    inline float TimeElapsedBetweenEvents(const Event& start, const Event& end) {
         float temp;
         CUDA4DNN_CHECK_CUDA(cudaEventElapsedTime(&temp, start.get(), end.get()));
         return temp;

@@ -537,6 +537,10 @@ struct LayerData
     std::vector<Ptr<BackendWrapper> > inputBlobsWrappers;
     std::vector<Ptr<BackendWrapper> > internalBlobsWrappers;
 
+#ifdef HAVE_CUDA
+    std::vector<int> cuda_background_transfer_ids;
+#endif
+
     Ptr<Layer> layerInstance;
     std::vector<Mat> outputBlobs;
     std::vector<Mat*> inputBlobs;
@@ -1110,7 +1114,9 @@ struct Net::Impl
             context.cublas_handle = cuda4dnn::csl::cublas::Handle(context.stream);
             context.cudnn_handle = cuda4dnn::csl::cudnn::Handle(context.stream);
 
-            cudaInfo = std::unique_ptr<CudaInfo_t>(new CudaInfo_t(std::move(context)));
+            auto d2h_stream = cuda4dnn::csl::Stream(true);
+            auto h2d_stream = cuda4dnn::csl::Stream(true);
+            cudaInfo = std::unique_ptr<CudaInfo_t>(new CudaInfo_t(std::move(context), std::move(d2h_stream), std::move(h2d_stream)));
         }
 #endif
     }
@@ -1138,8 +1144,10 @@ struct Net::Impl
 #ifdef HAVE_CUDA
     struct CudaInfo_t
     {
-        CudaInfo_t(cuda4dnn::csl::CSLContext ctxt) : context(std::move(ctxt)) { }
+        CudaInfo_t(cuda4dnn::csl::CSLContext ctxt, cuda4dnn::csl::Stream d2h_stream_, cuda4dnn::csl::Stream h2d_stream_)
+         : context(std::move(ctxt)), d2h_stream(std::move(d2h_stream_)), h2d_stream(std::move(h2d_stream_)) { }
         cuda4dnn::csl::CSLContext context;
+        cuda4dnn::csl::Stream d2h_stream, h2d_stream;
         cuda4dnn::csl::Workspace workspace;
     };
 
@@ -1374,7 +1382,7 @@ struct Net::Impl
             CV_Assert(it != layers.end());
             it->second.skip = netInputLayer->skip;
 
-            initBackend();
+            initBackend(blobsToKeep_);
 
             if (!netWasAllocated)
             {
@@ -1509,7 +1517,7 @@ struct Net::Impl
         ldOut.consumers.push_back(LayerPin(inLayerId, outNum));
     }
 
-    void initBackend()
+    void initBackend(const std::vector<LayerPin>& blobsToKeep_)
     {
         CV_TRACE_FUNCTION();
         if (preferableBackend == DNN_BACKEND_OPENCV)
@@ -1535,7 +1543,7 @@ struct Net::Impl
         else if (preferableBackend == DNN_BACKEND_VKCOM)
             initVkComBackend();
         else if (preferableBackend == DNN_BACKEND_CUDA)
-            initCUDABackend();
+            initCUDABackend(blobsToKeep_);
         else
             CV_Error(Error::StsNotImplemented, "Unknown backend identifier");
     }
@@ -2187,7 +2195,7 @@ struct Net::Impl
 #endif
     }
 
-    void initCUDABackend() {
+    void initCUDABackend(const std::vector<LayerPin>& blobsToKeep_) {
         CV_Assert(haveCUDA());
 
 #ifdef HAVE_CUDA
@@ -2212,6 +2220,76 @@ struct Net::Impl
 
             auto cudaNode = node.dynamicCast<CUDABackendNode>();
             cudaInfo->workspace.require(cudaNode->get_workspace_memory_in_bytes());
+        }
+
+        for (const auto& pin : blobsToKeep_)
+        {
+            auto lid = pin.lid;
+            auto oid = pin.oid;
+
+            LayerData& ld = layers[lid];
+            ld.cuda_background_transfer_ids.push_back(oid);
+        }
+
+        for (auto& layer : layers)
+        {
+            auto& ld = layer.second;
+            if (ld.skip)
+                continue;
+
+            if (ld.type == "DetectionOutput" || ld.type == "Proposal")
+            {
+                CV_Assert(ld.backendNodes.find(DNN_BACKEND_CUDA) == ld.backendNodes.end()); /* to prevent future regression */
+
+                /* Optimization #1: copy inputs in background */
+                for (auto pin : ld.inputBlobsId)
+                {
+                    auto input_ld = &layers[pin.lid];
+
+                    /* try to chase the input by travelling upwards through skipped layers */
+                    while(input_ld->skip &&
+                          input_ld->consumers.size() == 1 &&
+                          input_ld->inputBlobsId.size() == 1)
+                    {
+                        pin = input_ld->inputBlobsId[0];
+                        input_ld = &layers[pin.lid];
+                    }
+
+                    /* we have a complicated situation; skip the optimization */
+                    if (input_ld->skip)
+                        continue;
+
+                    /* Two cases if a backend node exists for the layer:
+                     * 1. data in host memory: any attempt to copy in background will be NOP (i.e. no need to handle this case explicitly)
+                     * 2. data in device memory: will cause a background transfer (which is what we want from this optimization)
+                     */
+                    if (input_ld->backendNodes.count(DNN_BACKEND_CUDA))
+                        input_ld->cuda_background_transfer_ids.push_back(pin.oid);
+                }
+
+                /* Optimization #2: copy outputs in background if required */
+                for (auto pin : ld.consumers)
+                {
+                    auto consumer_ld = &layers[pin.lid];
+
+                    /* try to chase the output by travelling downwards through skipped layers */
+                    while(consumer_ld->skip &&
+                          consumer_ld->consumers.size() == 1 &&
+                          consumer_ld->inputBlobsId.size() == 1)
+                    {
+                        pin = consumer_ld->inputBlobsId[0];
+                        consumer_ld = &layers[pin.lid];
+                    }
+
+                    /* we have a complicated situation; skip the optimization */
+                    if (consumer_ld->skip)
+                        continue;
+
+                    /* possible that the consumer does not use the data in memory */
+                    if (consumer_ld->backendNodes.count(DNN_BACKEND_CUDA))
+                        ld.cuda_background_transfer_ids.push_back(pin.oid);
+                }
+            }
         }
 #endif
     }
@@ -2265,7 +2343,7 @@ struct Net::Impl
                 if (IS_DNN_CUDA_TARGET(preferableTarget))
                 {
                     auto wrapper = ld.inputBlobsWrappers[i].dynamicCast<CUDABackendWrapper>();
-                    wrapper->setStream(cudaInfo->context.stream);
+                    wrapper->setStream(cudaInfo->context.stream, cudaInfo->h2d_stream, cudaInfo->d2h_stream);
                 }
 #endif
             }
@@ -2300,7 +2378,7 @@ struct Net::Impl
             if (IS_DNN_CUDA_TARGET(preferableTarget))
             {
                 auto wrapper = ld.outputBlobsWrappers[i].dynamicCast<CUDABackendWrapper>();
-                wrapper->setStream(cudaInfo->context.stream);
+                wrapper->setStream(cudaInfo->context.stream, cudaInfo->h2d_stream, cudaInfo->d2h_stream);
             }
 #endif
         }
@@ -2933,6 +3011,12 @@ struct Net::Impl
                     CV_Assert(!cudaNode.empty());
 
                     cudaNode->forward(ld.inputBlobsWrappers, ld.outputBlobsWrappers, cudaInfo->workspace);
+
+                    for (auto id : ld.cuda_background_transfer_ids)
+                    {
+                        auto wrapper = ld.outputBlobsWrappers[id].dynamicCast<CUDABackendWrapper>();
+                        wrapper->copyToHostInBackground();
+                    }
 #endif
                 }
                 else if (preferableBackend == DNN_BACKEND_HALIDE)
