@@ -301,6 +301,10 @@ namespace cv { namespace dnn {
 
             shape = shape_;
             shared_block = base->shared_block;
+
+            auto numel = total(shape_);
+            if (numel > shared_block->device.size())
+                shared_block->device.reset(numel);
         }
 
         static Ptr<BackendWrapper> create(Mat& m) {
