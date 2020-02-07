@@ -939,7 +939,9 @@ public:
         {
             // if dst already has been allocated with total(shape) elements,
             // it won't be recreated and pointer of dst.data remains the same.
+            std::cout << "BeforeCreateHost: " << (void*)dst.data << ' ' << dst.total() << std::endl;
             dst.create(shape, use_half ? CV_16S : CV_32F);
+            std::cout << "AfterCreateHost: " << (void*)dst.data << ' ' << dst.total() << std::endl;
             addHost(lp, dst);
         }
     }
@@ -1191,6 +1193,7 @@ struct Net::Impl
             shape[i] = host.size[i];
 
         void* data = host.data;
+        std::cout << "wrap(Mat& host): " << "host.data = " << data << ", host.total() = " << host.total() << std::endl;
         if (backendWrappers.find(data) != backendWrappers.end())
         {
             Ptr<BackendWrapper> baseBuffer = backendWrappers[data];

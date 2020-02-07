@@ -291,6 +291,7 @@ namespace cv { namespace dnn {
             }
 
             shared_block->device = cuda4dnn::csl::ManagedPtr<T>(m.total());
+            std::cout << "CreateWrapper: m.data = " << (void*)m.data << ", m.total() = " << m.total() << std::endl;
         }
 
         GenericCUDABackendWrapper(const Ptr<BackendWrapper>& base_, const MatShape& shape_)
@@ -305,6 +306,8 @@ namespace cv { namespace dnn {
             auto numel = total(shape_);
             if (numel > shared_block->device.size())
                 shared_block->device.reset(numel);
+
+            std::cout << "ReuseWrapper: host.data = " << (void*)shared_block->host.data << ", host.total() = " << shared_block->host.total() << ", required = " << numel << std::endl;
         }
 
         static Ptr<BackendWrapper> create(Mat& m) {
