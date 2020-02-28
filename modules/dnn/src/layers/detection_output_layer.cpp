@@ -42,6 +42,7 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
 #include "../op_inf_engine.hpp"
 
 #include <float.h>
@@ -55,6 +56,11 @@
 #ifdef HAVE_DNN_NGRAPH
 #include "../ie_ngraph.hpp"
 #include <ngraph/op/experimental/layers/detection_output.hpp>
+#endif
+
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/detection_output.hpp"
+using namespace cv::dnn::cuda4dnn;
 #endif
 
 namespace cv
@@ -204,6 +210,7 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV ||
+               backendId == DNN_BACKEND_CUDA ||
                ((backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 || backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH) && !_locPredTransposed && _bboxesNormalized);
     }
 
@@ -923,6 +930,54 @@ public:
             return 0.;
         }
     }
+
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
+    ) override
+    {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
+        cuda4dnn::DetectionOutputConfiguration config;
+
+        auto locations_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
+        auto locations_shape = locations_wrapper->getShape();
+        config.batch_size = locations_shape[0];
+
+        if (_codeType == "CORNER")
+        {
+            config.code_type = cuda4dnn::DetectionOutputConfiguration::CodeType::CORNER;
+        }
+        else if(_codeType == "CENTER_SIZE")
+        {
+            config.code_type = cuda4dnn::DetectionOutputConfiguration::CodeType::CENTER_SIZE;
+        }
+        else
+        {
+            CV_Error(Error::StsNotImplemented, _codeType + " code type not supported by CUDA backend in DetectionOutput layer");
+        }
+
+        auto priors_wrapper = inputs[2].dynamicCast<CUDABackendWrapper>();
+        auto priors_shape = priors_wrapper->getShape();
+
+        config.share_location = _shareLocation;
+        config.num_priors = priors_shape[2] / 4;
+        config.num_classes = _numClasses;
+        config.background_label_id = _backgroundLabelId;
+
+        config.transpose_location = _locPredTransposed;
+        config.variance_encoded_in_target = _varianceEncodedInTarget;
+        config.normalized_bbox = _bboxesNormalized;
+
+        config.clip_box = _clip;
+
+        config.classwise_topK = _topK;
+        config.confidence_threshold = _confidenceThreshold;
+        return make_cuda_node<cuda4dnn::DetectionOutputOp>(preferableTarget, std::move(context->stream), config);
+    }
+#endif
 
 #ifdef HAVE_INF_ENGINE
     virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper> >&) CV_OVERRIDE

@@ -150,8 +150,10 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
 
             auto blocks256 = (count * sizeof(T) + 255) / 256;
             if (bytes_remaining < blocks256 * 256)
+            {
+                std::cout << "remaining: " << bytes_remaining  << ", required: " << blocks256 * 256;
                 CV_Error(Error::StsNoMem, "out of workspace memory");
-
+            }
             bytes_remaining -= blocks256 * 256;
             current = static_cast<DevicePtr<std::int8_t>>(current) + blocks256 * 256;
             return Span<T>(static_cast<DevicePtr<T>>(ptr), count);
