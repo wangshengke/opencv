@@ -6,7 +6,7 @@
 #include <cuda_fp16.h>
 
 #include "math.hpp"
-#include "grid_stride_range.hpp"
+#include "stride_range.hpp"
 #include "execution.hpp"
 #include "vector_traits.hpp"
 
@@ -149,7 +149,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
             }
         }
 
-        template <class T, std::size_t MANTISSA_SBITS>
+        template <class T, std::size_t BINS>
         __global__ void findTopK(Span<int> indices, Span<int> count, View<T> scores, T threshold, size_type top_k, size_type num_classes, size_type class_offset, size_type num_priors, index_type background_label_id)
         {
             // indices: [batch_size, num_classes, topK]
@@ -161,70 +161,58 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
              * approximate algorithm but it almost always selects the boxes which would have been
              * selected by an exact sorting algorithm.
              *
-             * Each block handles a particular class of a particular batch item. Since we do not require
-             * many bins to accurately count sort the confidence scores, we can easily keep bin count array
-             * in shared memory.
+             * Each block handles a particular class of a particular batch item.
+             *
+             * If the background class is the first or the last class, we can optimize and avoid wasting
+             * a block. To know the exact details of `class_offset`, look at the host wrapper of this kernel.
              */
-            auto b = (blockIdx.x + class_offset) / num_classes;
-            auto c = (blockIdx.x + class_offset) % num_classes;
+            const auto b = (blockIdx.x + class_offset) / num_classes;
+            const auto c = (blockIdx.x + class_offset) % num_classes;
             if (c == background_label_id)
                 return;
 
-            /* The floating point numbers are represented in the following format:
-             *      [sign][exponent][mantissa]
-             * fp32    1      8         23
-             * fp16    1      5         10
-             *
-             * Since the confidence scores are always positive and at most one:
-             * - sign is always 0
-             * - exponent is always 0 (except for 1.0)
-             *
-             * Hence, we are only interested in the mantissa part (and exponent for 1.0).
-             *
-             * The most significant bits of the mantissa represent larger fractions, just like
-             * the most significant bits of a binary integer represent higher powers of two.
-             * For the purpose of comparing two floating point values, we can interpret the
-             * mantissa as an integer.
-             *
-             * We use a power of two number of bins (say 2^n). This allows us to index the `bins`
-             * array using the `n` most significant bits of the mantissa.
+            /* We do not require a large number of bins to find the top K confidence scores. We will use
+             * a reasonable number of bins which will fit in the shared memory.
              *
              * Note that smaller scores will have a smaller index, i.e. the `bins` are ordered in
              * ascending order.
              */
-            constexpr int BINS = 1 << MANTISSA_SBITS;
 
             __shared__ unsigned int bins[BINS];
-            for (int i = threadIdx.x; i < BINS; i += blockDim.x)
+            for (auto i : block_stride_range(BINS))
                 bins[i] = 0;
 
             __syncthreads();
 
-            for (int i = threadIdx.x; i < num_priors; i += blockDim.x)
+            for (auto i : block_stride_range(num_priors))
             {
-                auto confidence = scores[b * (num_classes * num_priors) + num_classes * c + i];
+                const auto confidence = scores[b * (num_classes * num_priors) + c * num_priors + i];
                 if (confidence > threshold)
                 {
-                    using device::extract_mantissa_bits;
-                    int mantissa_index = extract_mantissa_bits<T>(confidence, MANTISSA_SBITS);
-                    if (confidence == static_cast<T>(1.0))
-                        mantissa_index = BINS - 1; /* exponent is one; put it in the last bin */
+                    using device::clamp;
+                    int bin_index = static_cast<float>(confidence) * BINS;
+                    bin_index = clamp<int>(bin_index, 0, BINS - 1);
 
-                    atomicAdd(&bins[mantissa_index], 1);
+                    atomicAdd(&bins[bin_index], 1);
                 }
             }
 
             __syncthreads();
 
-            /* We have the counts of confidence scores in the bins. Now need to store the indices
+            /* We have the counts of confidence scores in the bins. Our ultimate goal is to store the indices
              * of the `top_k` confidence values in the `indices` array.
              *
              * We use a little trick to parallelize the process of filling up the `indices` array.
-             * We want every thread in the block to participate in the process. To do so, we compute
-             * the reverse prefix sum of the bins array (the reason will be explained later).
+             * We want every thread in the block to participate in the process. To do so, we shift the array
+             * one place to the left and then compute the suffix sum of the bins array. The reason will be
+             * explained later.
              */
             if (threadIdx.x == 0)
             {
+                for (int i = 0; i < BINS - 1; i++)
+                    bins[i] = bins[i + 1];
+                bins[BINS - 1] = 0;
+
                 for (int i = BINS - 1; i > 0; i--)
                     bins[i - 1] += bins[i];
             }
@@ -234,15 +222,13 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
 
             __syncthreads();
 
-            for (int i = threadIdx.x; i < num_priors; i += blockDim.x)
+            for (auto i : block_stride_range(num_priors))
             {
-                auto confidence = scores[b * (num_classes * num_priors) + num_classes * c + i];
+                const auto confidence = scores[b * (num_classes * num_priors) + c * num_priors + i];
                 if (confidence > threshold)
                 {
-                    using device::extract_mantissa_bits;
-                    int mantissa_index = extract_mantissa_bits<T>(confidence, MANTISSA_SBITS);
-                    if (confidence == static_cast<T>(1.0))
-                        mantissa_index = BINS - 1;
+                    int bin_index = float(confidence) * BINS;
+                    bin_index = clamp<int>(bin_index, 0, BINS - 1);
 
                     /* This bounding box is eligible to be selected unless it does not fall in
                      * the `top_k`. If it did, we would have to compute the location where it needs
@@ -258,25 +244,33 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                      * This requires that the boxes corresponding to the BIN3 must be stored first followed
                      * by BIN2, BIN1 and then BIN0.
                      *
-                     * By computing the prefix sums, we can obtain the starting index for the bounding boxes
-                     * corresponding to that bin.
+                     * We first shift values in the `bins` array to the left by one. This gives us:
+                     * BIN0 1
+                     * BIN1 3
+                     * BIN2 2
+                     * BIN3 0
+                     *
+                     * We now compute the suffix sum of the array. This gives us:
+                     * BIN0 6
+                     * BIN1 5
+                     * BIN2 2
+                     * BIN3 0
+                     *
+                     * The bins now give us the location in the `indices` array from which the indices of the
+                     * scores corresponding to that bin would be stored. We atomically increment the bin count
+                     * everytime we store an index corresponding to that bin. Therefore, the value in the bins
+                     * now give the index in the `indices` array where the next index corresponding to a score
+                     * in that bin must be put.
                      */
-                    index_type idx = bins[mantissa_index];
+
+                    const index_type idx = atomicAdd(&bins[bin_index], 1);
                     if (idx < top_k)
                     {
-                        indices[b * (top_k * num_classes) + c * top_k + idx] = i;
-
-                        /* We don't want a box to overwrite another box in its bin, so we increment the prefix sum
-                         * corresponding to that bin by one. This ensures that the next box in the bin will be stored
-                         * in the next empty slot.
-                         */
-                        atomicAdd(&bins[mantissa_index], 1);
+                        indices[b * (num_classes * top_k) + c * top_k + idx] = i;
                         atomicAdd(&count[b * num_classes + c], 1);
                     }
                 }
             }
-
-            __syncthreads();
         }
     }
 
@@ -405,8 +399,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
     {
         auto kernel = raw::decode_bbox<T, VARIANCE_ENCODED_IN_TARGET, CORNER_TRUE_CENTER_FALSE, CLIP_BBOX>;
         auto policy = make_policy(kernel, decoded_bboxes.size() / 4, 0, stream);
-        policy.grid = {1, 1, 1};
-        policy.block = { 1, 1, 1};
         launch_kernel(kernel, policy, decoded_bboxes, locations, priors, share_location, transpose_location, normalized_bbox, num_loc_classes, background_label_id, clip_width, clip_height);
     }
 
@@ -448,7 +440,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         auto num_classes = scores.get_axis_size(1);
         auto num_priors = scores.get_axis_size(2);
 
-        auto num_blocks = num_classes;
+        auto num_blocks = batch_size * num_classes;
         auto num_threads = std::min<std::size_t>(1024, num_priors);
         auto class_offset = 0;
         index_type optimized_bg_label_id = background_label_id;
@@ -476,7 +468,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         dim3 block_size(num_threads);
         auto policy = execution_policy(grid_size, block_size, stream);
 
-        auto kernel = raw::findTopK<T, 7>;
+        auto kernel = raw::findTopK<T, 256>;
         launch_kernel(kernel, policy, indices, count, scores, threshold, top_k, num_classes, class_offset, num_priors, optimized_bg_label_id);
     }
 

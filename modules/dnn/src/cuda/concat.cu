@@ -8,7 +8,7 @@
 #include "array.hpp"
 #include "types.hpp"
 #include "vector_traits.hpp"
-#include "grid_stride_range.hpp"
+#include "stride_range.hpp"
 #include "execution.hpp"
 #include "kernel_dispatcher.hpp"
 

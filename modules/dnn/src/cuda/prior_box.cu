@@ -9,7 +9,7 @@
 #include "math.hpp"
 #include "types.hpp"
 #include "vector_traits.hpp"
-#include "grid_stride_range.hpp"
+#include "stride_range.hpp"
 #include "execution.hpp"
 
 #include "../cuda4dnn/csl/stream.hpp"

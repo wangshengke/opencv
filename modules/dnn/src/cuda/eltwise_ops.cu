@@ -6,7 +6,7 @@
 #include <cuda_fp16.h>
 
 #include "math.hpp"
-#include "grid_stride_range.hpp"
+#include "stride_range.hpp"
 #include "execution.hpp"
 #include "vector_traits.hpp"
 

@@ -160,22 +160,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace de
     template <> inline __device__ __half2 ceil(__half2 value) { return h2ceil(value); }
 #endif
 
-    template <class T>  __device__ unsigned int extract_mantissa_bits(T value, int n_msbits);
-
-    template <> inline __device__ unsigned int extract_mantissa_bits(__half value, int n_msbits) {
-        // [sign][exponent][mantissa]
-        //    1      5         10      = 16 bits
-        auto raw = __half_as_ushort(value);
-        return (raw >> (10 - n_msbits) & (1 << (n_msbits - 1)));
-    }
-
-    template <> inline __device__ unsigned int extract_mantissa_bits(float value, int n_msbits) {
-        // [sign][exponent][mantissa]
-        //    1      8         23      = 32 bits
-        auto raw = __half_as_ushort(value);
-        return (raw >> (23 - n_msbits) & (1 << (n_msbits - 1)));
-    }
-
 }}}}} /* namespace cv::dnn::cuda4dnn::csl::device */
 
 #endif /* OPENCV_DNN_SRC_CUDA_MATH_HPP */
