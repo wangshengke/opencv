@@ -285,19 +285,29 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
             using vector_type = get_vector_type_t<T, 4>;
             auto decoded_bboxes_vPtr = vector_type::get_pointer(decoded_bboxes.data());
 
-            if (threadIdx.x == 0)
+            struct BoundingBox {
+                float xmin, ymin, xmax, ymax;
+            };
+
+            auto compute_size = [](BoundingBox bbox)->float
             {
-                struct BoundingBox {
-                    float xmin, ymin, xmax, ymax;
-                };
+                if (bbox.xmax < bbox.xmin || bbox.ymax < bbox.ymin)
+                    return 0.0;
 
-                const auto boxes = count[b * num_classes + c];
-                for (int i = 0; i < boxes; i++)
+                float width = bbox.xmax - bbox.xmin;
+                float height = bbox.ymax - bbox.ymin;
+                if (NORMALIZED_BBOX)
+                        return width * height;
+                else
+                        return (width + 1) * (height + 1);
+            };
+
+            const auto boxes = count[b * num_classes + c];
+            for (int i = 0; i < boxes; i++)
+            {
+                auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
+                if (prior_id != -1)
                 {
-                    auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
-                    if (prior_id == -1)
-                        continue;
-
                     index_type idxA;
                     if (share_location)
                     {
@@ -319,7 +329,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                     bbox1.xmax = boxA.data[2];
                     bbox1.ymax = boxA.data[3];
 
-                    for (int j = i + 1; j < boxes; j++)
+                    for (auto j : block_stride_range(i + 1, boxes))
                     {
                         prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + j];
                         if (prior_id == -1)
@@ -355,19 +365,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                         intersect_bbox.xmax = min(bbox1.xmax, bbox2.xmax);
                         intersect_bbox.ymax = min(bbox1.ymax, bbox2.ymax);
 
-                        auto compute_size = [](BoundingBox bbox)->float
-                        {
-                            if (bbox.xmax < bbox.xmin || bbox.ymax < bbox.ymin)
-                                return 0.0;
-
-                            float width = bbox.xmax - bbox.xmin;
-                            float height = bbox.ymax - bbox.ymin;
-                            if (NORMALIZED_BBOX)
-                                    return width * height;
-                            else
-                                    return (width + 1) * (height + 1);
-                        };
-
                         float intersect_size = compute_size(intersect_bbox), overlap = 0.0;
                         if (intersect_size > 0)
                         {
@@ -381,19 +378,21 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                     }
                 }
 
-                if (threadIdx.x == 0)
-                    count[b * num_classes + c] = 0;
+                __syncthreads();
+            }
 
-                // syncthreads
+            if (threadIdx.x == 0)
+                count[b * num_classes + c] = 0;
 
-                for (int i = 0; i < boxes; i++)
+            __syncthreads();
+
+            for (auto i : block_stride_range(boxes))
+            {
+                auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
+                if(prior_id != -1)
                 {
-                    auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
-                    if(prior_id != -1)
-                    {
-                        const index_type idx = atomicAdd(&count[b * num_classes + c], 1);
-                        indices[b * num_classes * classwise_topK + c * classwise_topK + idx] = prior_id;
-                    }
+                    const index_type idx = atomicAdd(&count[b * num_classes + c], 1);
+                    indices[b * num_classes * classwise_topK + c * classwise_topK + idx] = prior_id;
                 }
             }
         }
