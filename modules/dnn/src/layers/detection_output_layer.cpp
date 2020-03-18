@@ -210,7 +210,7 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV ||
-               backendId == DNN_BACKEND_CUDA ||
+               (backendId == DNN_BACKEND_CUDA && !_groupByClasses) ||
                ((backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 || backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH) && !_locPredTransposed && _bboxesNormalized);
     }
 
@@ -940,10 +940,15 @@ public:
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
 
-        cuda4dnn::DetectionOutputConfiguration config;
-
         auto locations_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
         auto locations_shape = locations_wrapper->getShape();
+
+        auto priors_wrapper = inputs[2].dynamicCast<CUDABackendWrapper>();
+        auto priors_shape = priors_wrapper->getShape();
+
+        CV_Assert(!_groupByClasses);
+
+        cuda4dnn::DetectionOutputConfiguration config;
         config.batch_size = locations_shape[0];
 
         if (_codeType == "CORNER")
@@ -959,9 +964,6 @@ public:
             CV_Error(Error::StsNotImplemented, _codeType + " code type not supported by CUDA backend in DetectionOutput layer");
         }
 
-        auto priors_wrapper = inputs[2].dynamicCast<CUDABackendWrapper>();
-        auto priors_shape = priors_wrapper->getShape();
-
         config.share_location = _shareLocation;
         config.num_priors = priors_shape[2] / 4;
         config.num_classes = _numClasses;
@@ -970,11 +972,13 @@ public:
         config.transpose_location = _locPredTransposed;
         config.variance_encoded_in_target = _varianceEncodedInTarget;
         config.normalized_bbox = _bboxesNormalized;
-
         config.clip_box = _clip;
 
         config.classwise_topK = _topK;
         config.confidence_threshold = _confidenceThreshold;
+        config.nms_threshold = _nmsThreshold;
+
+        config.keepTopK = _keepTopK;
         return make_cuda_node<cuda4dnn::DetectionOutputOp>(preferableTarget, std::move(context->stream), config);
     }
 #endif

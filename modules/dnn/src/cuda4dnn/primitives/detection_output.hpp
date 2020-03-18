@@ -10,6 +10,7 @@
 #include "../csl/stream.hpp"
 #include "../csl/tensor.hpp"
 
+#include "../kernels/fill_copy.hpp"
 #include "../kernels/permute.hpp"
 #include "../kernels/detection_output.hpp"
 
@@ -35,11 +36,13 @@ namespace cv { namespace dnn { namespace cuda4dnn {
         bool transpose_location;
         bool variance_encoded_in_target;
         bool normalized_bbox;
-
         bool clip_box;
 
         std::size_t classwise_topK;
         float confidence_threshold;
+        float nms_threshold;
+
+        int keepTopK;
     };
 
     template <class T>
@@ -60,13 +63,21 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             transpose_location = config.transpose_location;
             variance_encoded_in_target = config.variance_encoded_in_target;
             normalized_bbox = config.normalized_bbox;
-
             clip_box = config.clip_box;
 
             classwise_topK = config.classwise_topK;
-            if (classwise_topK == -1)
-                classwise_topK = num_priors;
             confidence_threshold = config.confidence_threshold;
+            nms_threshold = config.nms_threshold;
+
+            keepTopK = config.keepTopK;
+            CV_Assert(keepTopK > 0);
+
+            if (classwise_topK == -1)
+            {
+                classwise_topK = num_priors;
+                if (keepTopK > 0 && keepTopK < num_priors)
+                    classwise_topK = keepTopK;
+            }
 
             auto num_loc_classes = (share_location ? 1 : num_classes);
 
@@ -75,6 +86,9 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             builder.require<T>(config.batch_size * num_priors * num_classes); /* transposed scores */
             builder.require<int>(config.batch_size * num_classes * classwise_topK); /* indices */
             builder.require<int>(config.batch_size * num_classes); /* classwise topK count */
+            builder.require<int>(config.batch_size * keepTopK); /* final kept indices */
+            builder.require<int>(config.batch_size); /* kept indices count */
+            builder.require<int>(1); /* total number of detections */
             scratch_mem_in_bytes = builder.required_workspace_size();
         }
 
@@ -83,19 +97,25 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             const std::vector<cv::Ptr<BackendWrapper>>& outputs,
             csl::Workspace& workspace) override
         {
+            /* locations, scores and priors make the first three inputs in order  */
+            /* the 4th input is used to obtain the shape for clipping */
             CV_Assert((inputs.size() == 3 || inputs.size() == 4) && outputs.size() == 1);
 
+            // locations: [batch_size, num_priors, num_loc_classes, 4]
             auto locations_wrapper = inputs[0].dynamicCast<wrapper_type>();
             auto locations = locations_wrapper->getView();
 
+            // scores: [batch_size, num_priors, num_classes]
             auto scores_wrapper = inputs[1].dynamicCast<wrapper_type>();
             auto scores = scores_wrapper->getView();
             scores.unsqueeze();
             scores.reshape(-1, num_priors, num_classes);
 
+            // priors: [1, 2, num_priors, 4]
             auto priors_wrapper = inputs[2].dynamicCast<wrapper_type>();
             auto priors = priors_wrapper->getView();
 
+            // output: [1, 1, batch_size * keepTopK, 7]
             auto output_wrapper = outputs[0].dynamicCast<wrapper_type>();
             auto output = output_wrapper->getSpan();
 
@@ -103,15 +123,7 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             auto num_loc_classes = (share_location ? 1 : num_classes);
             locations.unsqueeze();
             locations.unsqueeze();
-            locations.reshape(-1, num_priors, num_loc_classes, 4);
-
-            csl::TensorSpan<T> decoded_boxes;
-            {
-                auto shape = std::vector<std::size_t>{batch_size, num_priors, num_loc_classes, 4};
-                csl::WorkspaceAllocator allocator(workspace);
-                decoded_boxes = allocator.get_tensor_span<T>(std::begin(shape), std::end(shape));
-                CV_Assert(is_shape_same(decoded_boxes, locations));
-            }
+            locations.reshape(batch_size, num_priors, num_loc_classes, 4);
 
             float clip_width = 0.0, clip_height = 0.0;
             if (clip_box)
@@ -131,36 +143,81 @@ namespace cv { namespace dnn { namespace cuda4dnn {
                 }
             }
 
+            csl::WorkspaceAllocator allocator(workspace);
+
+            // decoded_boxes: [batch_size, num_priors, num_loc_classes, 4]
+            csl::TensorSpan<T> decoded_boxes;
+            {
+                auto shape = std::vector<std::size_t>{batch_size, num_priors, num_loc_classes, 4};
+                decoded_boxes = allocator.get_tensor_span<T>(std::begin(shape), std::end(shape));
+
+                // std::cout << "decoded_boxes: ";
+                // for (auto i : decoded_boxes.shape_as_vector())
+                //     std::cout << i << ' ';
+                // std::cout << std::endl;
+
+                // std::cout << "locations: ";
+                // for (auto i : locations.shape_as_vector())
+                //     std::cout << i << ' ';
+                // std::cout << std::endl;
+                CV_Assert(is_shape_same(decoded_boxes, locations));
+            }
+
             kernels::decode_bboxes<T>(stream, decoded_boxes, locations, priors,
                 num_loc_classes, share_location, background_label_id,
                 transpose_location, variance_encoded_in_target,
                 corner_true_or_center_false, normalized_bbox,
                 clip_box, clip_width, clip_height);
 
+            // scores_permuted: [batch_size, num_classes, num_priors]
             csl::TensorSpan<T> scores_permuted;
             {
                 auto shape = std::vector<std::size_t>{batch_size, num_classes, num_priors};
-                csl::WorkspaceAllocator allocator(workspace);
                 scores_permuted = allocator.get_tensor_span<T>(std::begin(shape), std::end(shape));
             }
 
             kernels::permute<T>(stream, scores_permuted, scores, {0, 2, 1});
 
+            // indices: [batch_size, num_classes, classwise_topK]
             csl::TensorSpan<int> indices;
             {
-                auto shape = std::vector<std::size_t>{decoded_boxes.get_axis_size(0), num_classes, classwise_topK};
-                csl::WorkspaceAllocator allocator(workspace);
+                auto shape = std::vector<std::size_t>{batch_size, num_classes, classwise_topK};
                 indices = allocator.get_tensor_span<int>(std::begin(shape), std::end(shape));
             }
 
+            // count: [batch_size, num_classes]
             csl::TensorSpan<int> count;
             {
                 auto shape = std::vector<std::size_t>{batch_size, num_classes};
-                csl::WorkspaceAllocator allocator(workspace);
                 count = allocator.get_tensor_span<int>(std::begin(shape), std::end(shape));
             }
 
             kernels::findTopK<T>(stream, indices, count, scores_permuted, classwise_topK, background_label_id, confidence_threshold);
+
+            kernels::blockwise_class_nms<T>(stream, indices, count, decoded_boxes, share_location, normalized_bbox, background_label_id, nms_threshold);
+
+            // kept_indices: [batch_size, keepTopK]
+            csl::TensorSpan<int> kept_indices;
+            {
+                auto shape = std::vector<std::size_t>{batch_size, static_cast<std::size_t>(keepTopK)};
+                kept_indices = allocator.get_tensor_span<int>(std::begin(shape), std::end(shape));
+            }
+
+            // kept_count: [batch_size]
+            csl::TensorSpan<int> kept_count;
+            {
+                auto shape = std::vector<std::size_t>{batch_size};
+                kept_count = allocator.get_tensor_span<int>(std::begin(shape), std::end(shape));
+            }
+
+            kernels::nms_collect<T>(stream, kept_indices, kept_count, indices, count, scores_permuted, background_label_id);
+
+            auto num_detections = allocator.get_span<int>(1);
+            kernels::fill<int>(stream, num_detections, 0);
+
+            kernels::fill<T>(stream, output, 0.0);
+
+            kernels::consolidate_detections<T>(stream, output, kept_indices, kept_count, decoded_boxes, scores_permuted, share_location, num_detections.data());
         }
 
         std::size_t get_workspace_memory_in_bytes() const noexcept override { return scratch_mem_in_bytes; }
@@ -182,6 +239,9 @@ namespace cv { namespace dnn { namespace cuda4dnn {
 
         std::size_t classwise_topK;
         float confidence_threshold;
+        float nms_threshold;
+
+        int keepTopK;
     };
 
 }}} /* namespace cv::dnn::cuda4dnn */

@@ -21,6 +21,19 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
     template <class T>
     void findTopK(const csl::Stream& stream, csl::TensorSpan<int> indices, csl::TensorSpan<int> count, csl::TensorView<T> scores, std::size_t top_k, std::size_t background_label_id, float threshold);
 
+    template <class T>
+    void blockwise_class_nms(const csl::Stream& stream, csl::TensorSpan<int> indices, csl::TensorSpan<int> count, csl::TensorView<T> decoded_bboxes,
+        bool share_location, bool normalized_bbox, std::size_t background_label_id, float nms_threshold);
+
+    template <class T>
+    void nms_collect(const csl::Stream& stream, csl::TensorSpan<int> kept_indices, csl::TensorSpan<int> kept_count,
+        csl::TensorView<int> indices, csl::TensorView<int> count, csl::TensorView<T> scores, std::size_t background_label_id);
+
+    template <class T>
+    void consolidate_detections(const csl::Stream& stream, csl::TensorSpan<T> output,
+        csl::TensorView<int> kept_indices, csl::TensorView<int> kept_count,
+        csl::TensorView<T> decoded_bboxes, csl::TensorView<T> scores, bool share_location, csl::DevicePtr<int> num_detections);
+
 }}}} /* namespace cv::dnn::cuda4dnn::kernels */
 
 #endif /* OPENCV_DNN_SRC_CUDA4DNN_KERNELS_DETECTION_OUTPUT_HPP */

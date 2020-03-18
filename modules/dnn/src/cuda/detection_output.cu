@@ -21,12 +21,10 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
 
     namespace raw {
         template <class T, bool VARIANCE_ENCODED_IN_TARGET, bool CORNER_TRUE_CENTER_FALSE, bool CLIP_BBOX>
-        __global__ void decode_bbox(
-            Span<T> decoded_bboxes, View<T> locations, View<T> priors,
+        __global__ void decode_bbox(Span<T> decoded_bboxes, View<T> locations, View<T> priors,
             bool share_location, bool transpose_location, bool normalized_bbox,
             size_type num_loc_classes, index_type background_label_id,
-            float clip_width, float clip_height
-        )
+            float clip_width, float clip_height)
         {
             struct BoundingBox {
                 float xmin, ymin, xmax, ymax;
@@ -34,7 +32,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
 
             // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
             // locations: [batch_size, num_priors, num_loc_classes, 4]
-
             // priors: [1, 2, num_priors, 4]
             size_type num_priors = priors.size() / 8; /* 4 bbox values + 4 variance values per prior */
 
@@ -150,11 +147,11 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         }
 
         template <class T, std::size_t BINS>
-        __global__ void findTopK(Span<int> indices, Span<int> count, View<T> scores, T threshold, size_type top_k, size_type num_classes, size_type class_offset, size_type num_priors, index_type background_label_id)
+        __global__ void findTopK(Span<int> indices, Span<int> count, View<T> scores, float threshold, size_type top_k, size_type num_classes, size_type class_offset, size_type num_priors, index_type background_label_id)
         {
             // indices: [batch_size, num_classes, topK]
             // count: [batch_size, num_classes]
-            // scores: [batch_size, num_priors, num_classes]
+            // scores: [batch_size, num_classes, num_priors]
 
             /* We need to sort boxes based on their confidence scores. The confidence scores fall in
              * the range [0.0, 1.0]. We break the range into bins and perform count sort. This is an
@@ -164,7 +161,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
              * Each block handles a particular class of a particular batch item.
              *
              * If the background class is the first or the last class, we can optimize and avoid wasting
-             * a block. To know the exact details of `class_offset`, look at the host wrapper of this kernel.
+             * a block. To know the exact details of `class_offset`, look at the kernel launch function.
              */
             const auto b = (blockIdx.x + class_offset) / num_classes;
             const auto c = (blockIdx.x + class_offset) % num_classes;
@@ -186,11 +183,11 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
 
             for (auto i : block_stride_range(num_priors))
             {
-                const auto confidence = scores[b * (num_classes * num_priors) + c * num_priors + i];
+                const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + i];
                 if (confidence > threshold)
                 {
                     using device::clamp;
-                    int bin_index = static_cast<float>(confidence) * BINS;
+                    int bin_index = confidence * BINS;
                     bin_index = clamp<int>(bin_index, 0, BINS - 1);
 
                     atomicAdd(&bins[bin_index], 1);
@@ -224,10 +221,10 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
 
             for (auto i : block_stride_range(num_priors))
             {
-                const auto confidence = scores[b * (num_classes * num_priors) + c * num_priors + i];
+                const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + i];
                 if (confidence > threshold)
                 {
-                    int bin_index = float(confidence) * BINS;
+                    int bin_index = confidence * BINS;
                     bin_index = clamp<int>(bin_index, 0, BINS - 1);
 
                     /* This bounding box is eligible to be selected unless it does not fall in
@@ -266,129 +263,277 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                     const index_type idx = atomicAdd(&bins[bin_index], 1);
                     if (idx < top_k)
                     {
-                        indices[b * (num_classes * top_k) + c * top_k + idx] = i;
+                        indices[b * num_classes * top_k + c * top_k + idx] = i;
                         atomicAdd(&count[b * num_classes + c], 1);
                     }
                 }
             }
         }
-    }
 
-    template <class T, bool NORMALIZED_BBOX>
-    __global__ void blockwise_class_nms(Span<int> indices, View<int> count, View<T> decoded_bboxes, size_type num_classes, size_type class_offset, size_type top_k, index_type background_label_id, float nms_threshold)
-    {
-        // indices: [batch_size, num_classes, topK]
-        // count: [batch_size, num_classes]
-
-        auto b = (blockIdx.x + class_offset) / num_classes;
-        auto c = (blockIdx.x + class_offset) % num_classes;
-        if (c == background_label_id)
-            return;
-
-        using vector_type = get_vector_type_t<T, 4>;
-        auto decoded_bboxes_vPtr = vector_type::get_pointer(decoded_bboxes.data());
-
-        if (threadIdx.x == 0)
+        template <class T, bool NORMALIZED_BBOX>
+        __global__ void blockwise_class_nms(Span<int> indices, Span<int> count, View<T> decoded_bboxes, bool share_location, size_type num_priors, size_type num_classes, size_type class_offset, size_type classwise_topK, index_type background_label_id, float nms_threshold)
         {
-            struct BoundingBox {
-                float xmin, ymin, xmax, ymax;
-            };
+            // indices: [batch_size, num_classes, classwise_topK]
+            // count: [batch_size, num_classes]
+            // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
 
-            const auto boxes = count[b * num_classes + c];
-            for (int i = 0; i < boxes; i++)
+            auto b = (blockIdx.x + class_offset) / num_classes;
+            auto c = (blockIdx.x + class_offset) % num_classes;
+            if (c == background_label_id)
+                return;
+
+            using vector_type = get_vector_type_t<T, 4>;
+            auto decoded_bboxes_vPtr = vector_type::get_pointer(decoded_bboxes.data());
+
+            if (threadIdx.x == 0)
             {
-                auto idxA = indices[b * num_classes * top_k + c * num_classes + i];
-                if (idxA == -1)
-                    continue;
+                struct BoundingBox {
+                    float xmin, ymin, xmax, ymax;
+                };
 
-                vector_type boxA;
-                v_load(boxA, decoded_bboxes_vPtr[idxA]);
-
-                BoundingBox bbox1;
-                bbox1.xmin = boxA.data[0];
-                bbox1.ymin = boxA.data[1];
-                bbox1.xmax = boxA.data[2];
-                bbox1.ymax = boxA.data[3];
-
-                for (int j = i; j < boxes; j++)
+                const auto boxes = count[b * num_classes + c];
+                for (int i = 0; i < boxes; i++)
                 {
-                    auto idxB = indices[b * num_classes * top_k + c * num_classes + j];
-                    if (idxB == -1)
+                    auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
+                    if (prior_id == -1)
                         continue;
 
-                    vector_type boxB;
-                    v_load(boxB, decoded_bboxes_vPtr[idxB]);
-
-                    BoundingBox bbox2;
-                    bbox2.xmin = boxB.data[0];
-                    bbox2.ymin = boxB.data[1];
-                    bbox2.xmax = boxB.data[2];
-                    bbox2.ymax = boxB.data[3];
-
-                    using device::min;
-                    using device::max;
-
-                    BoundingBox intersect_bbox;
-                    intersect_bbox.xmin = std::max(bbox1.xmin, bbox2.xmin);
-                    intersect_bbox.ymin = std::max(bbox1.ymin, bbox2.ymin);
-                    intersect_bbox.xmax = std::min(bbox1.xmax, bbox2.xmax);
-                    intersect_bbox.ymax = std::min(bbox1.ymax, bbox2.ymax);
-
-                    float intersect_size = 0.0;
-                    if (!(intersect_bbox.xmax < intersect_bbox.xmin || intersect_bbox.ymax < intersect_bbox.ymin))
+                    index_type idxA;
+                    if (share_location)
                     {
-                        float width = intersect_bbox.xmax - intersect_bbox.xmin;
-                        float height = intersect_bbox.ymax - intersect_bbox.ymin;
-                        if (NORMALIZED_BBOX)
+                        // decoded_bboxes: [batch_size, num_priors, 1, 4]
+                        idxA = b * num_priors + prior_id;
+                    }
+                    else
+                    {
+                        // decoded_bboxes: [batch_size, num_priors, num_classes, 4]
+                        idxA = b * num_priors * num_classes + prior_id * num_classes + c;
+                    }
+
+                    vector_type boxA;
+                    v_load(boxA, decoded_bboxes_vPtr[idxA]);
+
+                    BoundingBox bbox1;
+                    bbox1.xmin = boxA.data[0];
+                    bbox1.ymin = boxA.data[1];
+                    bbox1.xmax = boxA.data[2];
+                    bbox1.ymax = boxA.data[3];
+
+                    for (int j = i + 1; j < boxes; j++)
+                    {
+                        prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + j];
+                        if (prior_id == -1)
+                            continue;
+
+                        index_type idxB;
+                        if (share_location)
                         {
-                            intersect_size = width * height;
+                            // decoded_bboxes: [batch_size, num_priors, 1, 4]
+                            idxB = b * num_priors + prior_id;
                         }
                         else
                         {
-                            intersect_size = (width + 1) * (height + 1);
+                            // decoded_bboxes: [batch_size, num_priors, num_classes, 4]
+                            idxB = b * num_priors * num_classes + prior_id * num_classes + c;
                         }
-                    }
 
-                    float overlap = 0;
-                    if (intersect_size > 0)
+                        vector_type boxB;
+                        v_load(boxB, decoded_bboxes_vPtr[idxB]);
+
+                        BoundingBox bbox2;
+                        bbox2.xmin = boxB.data[0];
+                        bbox2.ymin = boxB.data[1];
+                        bbox2.xmax = boxB.data[2];
+                        bbox2.ymax = boxB.data[3];
+
+                        using device::min;
+                        using device::max;
+
+                        BoundingBox intersect_bbox;
+                        intersect_bbox.xmin = max(bbox1.xmin, bbox2.xmin);
+                        intersect_bbox.ymin = max(bbox1.ymin, bbox2.ymin);
+                        intersect_bbox.xmax = min(bbox1.xmax, bbox2.xmax);
+                        intersect_bbox.ymax = min(bbox1.ymax, bbox2.ymax);
+
+                        auto compute_size = [](BoundingBox bbox)->float
+                        {
+                            if (bbox.xmax < bbox.xmin || bbox.ymax < bbox.ymin)
+                                return 0.0;
+
+                            float width = bbox.xmax - bbox.xmin;
+                            float height = bbox.ymax - bbox.ymin;
+                            if (NORMALIZED_BBOX)
+                                    return width * height;
+                            else
+                                    return (width + 1) * (height + 1);
+                        };
+
+                        float intersect_size = compute_size(intersect_bbox), overlap = 0.0;
+                        if (intersect_size > 0)
+                        {
+                            float bbox1_size = compute_size(bbox1);
+                            float bbox2_size = compute_size(bbox2);
+                            overlap = intersect_size / (bbox1_size + bbox2_size - intersect_size);
+                        }
+
+                        if (overlap > nms_threshold)
+                            indices[b * num_classes * classwise_topK + c * classwise_topK + j] = -1;
+                    }
+                }
+
+                if (threadIdx.x == 0)
+                    count[b * num_classes + c] = 0;
+
+                // syncthreads
+
+                for (int i = 0; i < boxes; i++)
+                {
+                    auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
+                    if(prior_id != -1)
                     {
-                        float bbox1_size = 0, bbox2_size = 0;
-                        if (!(bbox1.xmax < bbox1.xmin || bbox1.ymax < bbox1.ymin))
-                        {
-                            float width = bbox1.xmax - bbox1.xmin;
-                            float height = bbox1.ymax - bbox1.ymin;
-                            if (NORMALIZED_BBOX)
-                            {
-                                bbox1_size = width * height;
-                            }
-                            else
-                            {
-                                bbox1_size = (width + 1) * (height + 1);
-                            }
-                        }
-
-                        if (!(bbox2.xmax < bbox2.xmin || bbox2.ymax < bbox2.ymin))
-                        {
-                            float width = bbox2.xmax - bbox2.xmin;
-                            float height = bbox2.ymax - bbox2.ymin;
-                            if (NORMALIZED_BBOX)
-                            {
-                                bbox2_size = width * height;
-                            }
-                            else
-                            {
-                                bbox2_size = (width + 1) * (height + 1);
-                            }
-                        }
-
-                        overlap = intersect_size / (bbox1_size + bbox2_size - intersect_size);
+                        const index_type idx = atomicAdd(&count[b * num_classes + c], 1);
+                        indices[b * num_classes * classwise_topK + c * classwise_topK + idx] = prior_id;
                     }
-
-                    if (overlap > nms_threshold)
-                        indices[b * num_classes * top_k + c * num_classes + j] = -1;
                 }
             }
         }
+
+        template <class T, std::size_t BINS>
+        __global__ void nms_collect(
+            Span<int> kept_indices, Span<int> kept_count, View<int> indices, View<int> count, View<T> scores,
+            size_type num_classes, size_type num_priors, size_type classwise_topK, size_type keepTopK, index_type background_label_id)
+        {
+            // kept_indices: [batch_size, keepTopK]
+            // kept_count: [batch_size]
+
+            // indices: [batch_size, num_classes, topK]
+            // count: [batch_size, num_classes]
+            // scores: [batch_size, num_classes, num_priors]
+
+            const auto b = blockIdx.x;
+
+            __shared__ unsigned int bins[BINS];
+            for (auto i : block_stride_range(BINS))
+                bins[i] = 0;
+
+            __syncthreads();
+
+            if (threadIdx.x == 0)
+            {
+                for (int c = 0; c < num_classes; c++)
+                {
+                    if (c == background_label_id)
+                        continue;
+
+                    auto boxes = count[b * num_classes + c];
+                    for (int i = 0; i < boxes; i++)
+                    {
+                        auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
+                        const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + prior_id];
+
+                        using device::clamp;
+                        int bin_index = confidence * BINS;
+                        bin_index = clamp<int>(bin_index, 0, BINS - 1);
+
+                        atomicAdd(&bins[bin_index], 1);
+                    }
+                }
+            }
+
+            __syncthreads();
+
+            if (threadIdx.x == 0)
+            {
+                for (int i = 0; i < BINS - 1; i++)
+                    bins[i] = bins[i + 1];
+                bins[BINS - 1] = 0;
+
+                for (int i = BINS - 1; i > 0; i--)
+                    bins[i - 1] += bins[i];
+            }
+
+            if (threadIdx.x == 0)
+                kept_count[b] = 0;
+
+            __syncthreads();
+
+            if (threadIdx.x == 0)
+            {
+                for (int c = 0; c < num_classes; c++)
+                {
+                    if (c == background_label_id)
+                        continue;
+
+                    auto boxes = count[b * num_classes + c];
+                    for (int i = 0; i < boxes; i++)
+                    {
+                        auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
+                        const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + prior_id];
+
+                        int bin_index = confidence * BINS;
+                        bin_index = clamp<int>(bin_index, 0, BINS - 1);
+
+                        const index_type idx = atomicAdd(&bins[bin_index], 1);
+                        if (idx < keepTopK)
+                        {
+                            kept_indices[b * keepTopK + idx] = c * num_priors + prior_id;
+                            atomicAdd(&kept_count[b], 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        template <class T>
+        __global__ void consolidate_detections(Span<T> output,
+            View<int> kept_indices, View<int> kept_count, View<T> decoded_bboxes, View<T> scores, bool share_location,
+            size_type batch_size, size_type num_classes, size_type num_priors, size_type keepTopK, DevicePtr<int> num_detections)
+            {
+                using vector_type = get_vector_type_t<T, 4>;
+                auto decoded_bboxes_vPtr = vector_type::get_pointer(decoded_bboxes.data());
+
+                // output: [1, 1, batch_size * keepTopK, 7]
+                // kept_indices: [batch_size, keepTopK]
+                // kept_count: [batch_size]
+                // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
+                // scores: [batch_size, num_classes, num_priors]
+
+                for (int b = 0; b < batch_size; b++)
+                {
+                    for (auto i : grid_stride_range(kept_count[b]))
+                    {
+                        auto score_id = kept_indices[b * keepTopK + i];
+                        auto c = score_id / num_priors;
+                        auto prior_id = score_id % num_priors;
+
+                        const auto confidence = scores[b * num_classes * num_priors + score_id];
+
+                        index_type bbox_id;
+                        if (share_location)
+                        {
+                            // decoded_bboxes: [batch_size, num_priors, 1, 4]
+                            bbox_id = b * num_priors + prior_id;
+                        }
+                        else
+                        {
+                            // decoded_bboxes: [batch_size, num_priors, num_classes, 4]
+                            bbox_id = b * num_priors * num_classes + prior_id * num_classes + c;
+                        }
+
+                        vector_type bbox;
+                        v_load(bbox, decoded_bboxes_vPtr[bbox_id]);
+
+                        auto output_id = atomicAdd(num_detections.get(), 1);
+                        output[output_id * 7 + 0] = b;
+                        output[output_id * 7 + 1] = c;
+                        output[output_id * 7 + 2] = confidence;
+                        output[output_id * 7 + 3] = bbox.data[0];
+                        output[output_id * 7 + 4] = bbox.data[1];
+                        output[output_id * 7 + 5] = bbox.data[2];
+                        output[output_id * 7 + 6] = bbox.data[3];
+                    }
+                }
+            }
     }
 
     template <class T, bool VARIANCE_ENCODED_IN_TARGET, bool CORNER_TRUE_CENTER_FALSE, bool CLIP_BBOX>
@@ -436,6 +581,10 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
     template <class T>
     void findTopK(const Stream& stream, TensorSpan<int> indices, TensorSpan<int> count, TensorView<T> scores, std::size_t top_k, std::size_t background_label_id, float threshold)
     {
+        // indices: [batch_size, num_classes, topK]
+        // count: [batch_size, num_classes]
+        // scores: [batch_size, num_classes, num_priors]
+
         auto batch_size = scores.get_axis_size(0);
         auto num_classes = scores.get_axis_size(1);
         auto num_priors = scores.get_axis_size(2);
@@ -468,11 +617,137 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         dim3 block_size(num_threads);
         auto policy = execution_policy(grid_size, block_size, stream);
 
-        auto kernel = raw::findTopK<T, 256>;
+        auto kernel = raw::findTopK<T, 512>;
         launch_kernel(kernel, policy, indices, count, scores, threshold, top_k, num_classes, class_offset, num_priors, optimized_bg_label_id);
     }
 
     template void findTopK(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<__half>, std::size_t, std::size_t, float);
     template void findTopK(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<float>, std::size_t, std::size_t, float);
+
+    template <class T>
+    void blockwise_class_nms(const Stream& stream, TensorSpan<int> indices, TensorSpan<int> count, TensorView<T> decoded_bboxes,
+        bool share_location, bool normalized_bbox, std::size_t background_label_id, float nms_threshold)
+    {
+        // indices: [batch_size, num_classes, topK]
+        // count: [batch_size, num_classes]
+        // decoded_bboxes: [batch_size, num_priors, num_pred_classes, 4]
+
+        auto batch_size = indices.get_axis_size(0);
+        auto num_classes = indices.get_axis_size(1);
+        auto top_k = indices.get_axis_size(2);
+        auto num_priors = decoded_bboxes.get_axis_size(1);
+
+        CV_Assert(count.get_axis_size(0) == batch_size);
+        CV_Assert(count.get_axis_size(1) == num_classes);
+        CV_Assert(decoded_bboxes.get_axis_size(0) == batch_size);
+
+        auto num_blocks = batch_size * num_classes;
+        auto num_threads = std::min<std::size_t>(1024, top_k);
+
+        auto class_offset = 0;
+        index_type optimized_bg_label_id = background_label_id;
+
+        /* we can perform optimize cases where:
+         * - `background_label_id` is the first class
+         * - `background_label_id` is the last class
+         */
+        if (background_label_id == num_classes - 1)
+        {
+            /* skip the last class */
+            num_blocks -= 1;
+            optimized_bg_label_id = -1;
+        }
+
+        if (background_label_id == 0)
+        {
+            /* skip the first class and inform the kernel that the real classes start from one */
+            class_offset = 1;
+            num_blocks -= 1;
+            optimized_bg_label_id = -1;
+        }
+
+        dim3 grid_size(num_blocks);
+        dim3 block_size(num_threads);
+        auto policy = execution_policy(grid_size, block_size, stream);
+
+        if (normalized_bbox)
+        {
+            auto kernel = raw::blockwise_class_nms<T, true>;
+            launch_kernel(kernel, policy, indices, count, decoded_bboxes, share_location, num_priors, num_classes, class_offset, top_k, optimized_bg_label_id, nms_threshold);
+        }
+        else
+        {
+            auto kernel = raw::blockwise_class_nms<T, false>;
+            launch_kernel(kernel, policy, indices, count, decoded_bboxes, share_location, num_priors, num_classes, class_offset, top_k, optimized_bg_label_id, nms_threshold);
+        }
+    }
+
+    template void blockwise_class_nms(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<__half>, bool, bool, std::size_t, float);
+    template void blockwise_class_nms(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<float>, bool, bool, std::size_t, float);
+
+    template <class T>
+    void nms_collect(const Stream& stream, TensorSpan<int> kept_indices, TensorSpan<int> kept_count,
+        TensorView<int> indices, TensorView<int> count, TensorView<T> scores, std::size_t background_label_id)
+    {
+        // kept_indices: [batch_size, keepTopK]
+        // kept_count: [batch_size]
+
+        // indices: [batch_size, num_classes, classwise_topK]
+        // count: [batch_size, num_classes]
+        // scores: [batch_size, num_classes, num_priors]
+
+        auto batch_size = kept_indices.get_axis_size(0);
+        CV_Assert(kept_count.get_axis_size(0) == batch_size);
+        CV_Assert(indices.get_axis_size(0) == batch_size);
+        CV_Assert(count.get_axis_size(0) == batch_size);
+        CV_Assert(scores.get_axis_size(0) == batch_size);
+
+        auto keepTopK = kept_indices.get_axis_size(1);
+
+        auto num_classes = indices.get_axis_size(1);
+        CV_Assert(count.get_axis_size(1) == num_classes);
+        CV_Assert(scores.get_axis_size(1) == num_classes);
+
+        auto classwise_topK = indices.get_axis_size(2);
+        auto num_priors = scores.get_axis_size(2);
+
+        auto num_blocks = batch_size;
+        auto num_threads = 1024; // TODO
+
+        dim3 grid_size(num_blocks);
+        dim3 block_size(num_threads);
+        auto policy = execution_policy(grid_size, block_size, stream);
+
+        auto kernel = raw::nms_collect<T, 256>;
+        launch_kernel(kernel, policy, kept_indices, kept_count, indices, count, scores, num_classes, num_priors, classwise_topK, keepTopK, background_label_id);
+    }
+
+    template void nms_collect(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<int>, TensorView<int>, TensorView<__half>, std::size_t);
+    template void nms_collect(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<int>, TensorView<int>, TensorView<float>, std::size_t);
+
+    template <class T>
+    void consolidate_detections(const Stream& stream, TensorSpan<T> output,
+        TensorView<int> kept_indices, TensorView<int> kept_count,
+        TensorView<T> decoded_bboxes, TensorView<T> scores, bool share_location, DevicePtr<int> num_detections)
+    {
+        // output: [1, 1, batch_size * keepTopK, 7]
+        // kept_indices: [batch_size, keepTopK]
+        // kept_count: [batch_size]
+        // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
+        // scores: [batch_size, num_classes, num_priors]
+
+        auto batch_size = kept_indices.get_axis_size(0);
+        auto keepTopK = kept_indices.get_axis_size(1);
+
+        auto num_classes = scores.get_axis_size(1);
+        auto num_priors = scores.get_axis_size(2);
+
+        auto kernel = raw::consolidate_detections<T>;
+        auto policy = make_policy(kernel, keepTopK, 0, stream);
+        launch_kernel(kernel, policy, output, kept_indices, kept_count, decoded_bboxes, scores, share_location, batch_size, num_classes, num_priors, keepTopK, num_detections);
+    }
+
+    template void consolidate_detections(const Stream&, TensorSpan<__half>, TensorView<int>, TensorView<int>, TensorView<__half>, TensorView<__half>, bool, DevicePtr<int>);
+    template void consolidate_detections(const Stream&, TensorSpan<float>, TensorView<int>, TensorView<int>, TensorView<float>, TensorView<float>, bool, DevicePtr<int>);
 
 }}}} /* namespace cv::dnn::cuda4dnn::kernels */
