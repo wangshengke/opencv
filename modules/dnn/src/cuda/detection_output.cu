@@ -20,20 +20,20 @@ using namespace cv::dnn::cuda4dnn::csl::device;
 namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
 
     namespace raw {
+        struct BoundingBox {
+            float xmin, ymin, xmax, ymax;
+        };
+
         template <class T, bool VARIANCE_ENCODED_IN_TARGET, bool CORNER_TRUE_CENTER_FALSE, bool CLIP_BBOX>
         __global__ void decode_bbox(Span<T> decoded_bboxes, View<T> locations, View<T> priors,
             bool share_location, bool transpose_location, bool normalized_bbox,
             size_type num_loc_classes, index_type background_label_id,
             float clip_width, float clip_height)
         {
-            struct BoundingBox {
-                float xmin, ymin, xmax, ymax;
-            };
-
             // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
             // locations: [batch_size, num_priors, num_loc_classes, 4]
             // priors: [1, 2, num_priors, 4]
-            size_type num_priors = priors.size() / 8; /* 4 bbox values + 4 variance values per prior */
+            const size_type num_priors = priors.size() / 8; /* 4 bbox values + 4 variance values per prior */
 
             using vector_type = get_vector_type_t<T, 4>;
             auto locations_vPtr = vector_type::get_pointer(locations.data());
@@ -186,8 +186,10 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                 const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + i];
                 if (confidence > threshold)
                 {
+                    auto conf_scaled = (confidence - threshold)/(1 - threshold);
+
                     using device::clamp;
-                    int bin_index = confidence * BINS;
+                    int bin_index = conf_scaled * BINS;
                     bin_index = clamp<int>(bin_index, 0, BINS - 1);
 
                     atomicAdd(&bins[bin_index], 1);
@@ -204,14 +206,73 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
              * one place to the left and then compute the suffix sum of the bins array. The reason will be
              * explained later.
              */
-            if (threadIdx.x == 0)
+            if (threadIdx.x < warpSize)
             {
-                for (int i = 0; i < BINS - 1; i++)
-                    bins[i] = bins[i + 1];
-                bins[BINS - 1] = 0;
+                for (int i = threadIdx.x; i < BINS - 1; i += warpSize)
+                {
+                    auto temp = bins[i + 1];
+                    __syncwarp();
+                    bins[i] = temp;
+                    // bins[i] won't be read again => no need for __syncwarp here
+                }
 
-                for (int i = BINS - 1; i > 0; i--)
-                    bins[i - 1] += bins[i];
+                if (threadIdx.x == 0)
+                    bins[BINS - 1] = 0;
+
+                /* We can compute suffix sum of an array in groups of N numbers.
+                 * Let N be 4 for this example.
+                 *
+                 * 1) Last 4 numbers
+                 *                      1   2   3   4   |   5   6   7   8   |   9   10  11  12
+                 * local suffix sum:                                            42  33  23  12
+                 *
+                 * 2) Middle 4 numbers
+                 *                      1   2   3   4   |   5   6   7   8   |   9   10  11  12
+                 * local suffix sum:                    |   26  21  15  8   |
+                 *
+                 * We add `42` (first element in the previous local group) to each element to get:
+                 *
+                 *                      1   2   3   4   |   5   6   7   8   |   9   10  11  12
+                 *                                      |   68  63  57  50  |   42  33  23  12
+                 * 3) First 4 numbers
+                 *
+                 *                      1   2   3   4   |   5   6   7   8   |   9   10  11  12
+                 * local suffix sum:    10  9   7   4   |
+                 *
+                 * We add `68` (first element in the previous local group) to each element to get:
+                 *
+                 *                      1   2   3   4   |   5   6   7   8   |   9   10  11  12
+                 * local suffix sum:    78  77  75  72  |   68  63  57  50  |   42  33  23  12
+                 *
+                 * What we are left with now is the suffix sum of the entire array.
+                 *
+                 * We use the aforementioned logic but work in groups of `warpSize`.
+                 */
+                constexpr int group_size = 32; /* must be equal to warpSize */
+                assert(group_size == warpSize);
+
+                static_assert(BINS % group_size == 0, "number of bins must be a multiple of warpSize");
+
+                const auto inverse_lane_id = group_size - threadIdx.x - 1;
+                unsigned int previous_group_first_element = 0;
+
+                for (int warp_id = BINS / group_size - 1; warp_id >= 0; warp_id--)
+                {
+                    auto idx = warp_id * group_size + threadIdx.x;
+                    auto value = bins[idx];
+
+                    for (int i = 1; i < group_size; i *= 2)
+                    {
+                        int n = __shfl_down_sync(0xFFFFFFFF, value, i);
+                        if (inverse_lane_id >= i)
+                            value += n;
+                    }
+
+                    value += previous_group_first_element;
+                    bins[idx] = value;
+
+                    previous_group_first_element = __shfl_sync(0xFFFFFFFF, value, 0);
+                }
             }
 
             if (threadIdx.x == 0)
@@ -224,7 +285,9 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                 const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + i];
                 if (confidence > threshold)
                 {
-                    int bin_index = confidence * BINS;
+                    auto conf_scaled = (confidence - threshold)/(1 - threshold);
+
+                    int bin_index = conf_scaled * BINS;
                     bin_index = clamp<int>(bin_index, 0, BINS - 1);
 
                     /* This bounding box is eligible to be selected unless it does not fall in
@@ -270,6 +333,20 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
             }
         }
 
+        template <bool NORMALIZED_BBOX>
+        __device__ float compute_size(BoundingBox bbox)
+        {
+            if (bbox.xmax < bbox.xmin || bbox.ymax < bbox.ymin)
+                return 0.0;
+
+            float width = bbox.xmax - bbox.xmin;
+            float height = bbox.ymax - bbox.ymin;
+            if (NORMALIZED_BBOX)
+                return width * height;
+            else
+                return (width + 1) * (height + 1);
+        }
+
         template <class T, bool NORMALIZED_BBOX>
         __global__ void blockwise_class_nms(Span<int> indices, Span<int> count, View<T> decoded_bboxes, bool share_location, size_type num_priors, size_type num_classes, size_type class_offset, size_type classwise_topK, index_type background_label_id, float nms_threshold)
         {
@@ -285,40 +362,15 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
             using vector_type = get_vector_type_t<T, 4>;
             auto decoded_bboxes_vPtr = vector_type::get_pointer(decoded_bboxes.data());
 
-            struct BoundingBox {
-                float xmin, ymin, xmax, ymax;
-            };
-
-            auto compute_size = [](BoundingBox bbox)->float
-            {
-                if (bbox.xmax < bbox.xmin || bbox.ymax < bbox.ymin)
-                    return 0.0;
-
-                float width = bbox.xmax - bbox.xmin;
-                float height = bbox.ymax - bbox.ymin;
-                if (NORMALIZED_BBOX)
-                        return width * height;
-                else
-                        return (width + 1) * (height + 1);
-            };
-
             const auto boxes = count[b * num_classes + c];
             for (int i = 0; i < boxes; i++)
             {
                 auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
                 if (prior_id != -1)
                 {
-                    index_type idxA;
-                    if (share_location)
-                    {
-                        // decoded_bboxes: [batch_size, num_priors, 1, 4]
-                        idxA = b * num_priors + prior_id;
-                    }
-                    else
-                    {
-                        // decoded_bboxes: [batch_size, num_priors, num_classes, 4]
-                        idxA = b * num_priors * num_classes + prior_id * num_classes + c;
-                    }
+                    const index_type idxA = share_location ?
+                        b * num_priors + prior_id :
+                        b * num_priors * num_classes + prior_id * num_classes + c;
 
                     vector_type boxA;
                     v_load(boxA, decoded_bboxes_vPtr[idxA]);
@@ -335,17 +387,9 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                         if (prior_id == -1)
                             continue;
 
-                        index_type idxB;
-                        if (share_location)
-                        {
-                            // decoded_bboxes: [batch_size, num_priors, 1, 4]
-                            idxB = b * num_priors + prior_id;
-                        }
-                        else
-                        {
-                            // decoded_bboxes: [batch_size, num_priors, num_classes, 4]
-                            idxB = b * num_priors * num_classes + prior_id * num_classes + c;
-                        }
+                        const index_type idxB = share_location ?
+                            b * num_priors + prior_id :
+                            b * num_priors * num_classes + prior_id * num_classes + c;
 
                         vector_type boxB;
                         v_load(boxB, decoded_bboxes_vPtr[idxB]);
@@ -365,11 +409,11 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
                         intersect_bbox.xmax = min(bbox1.xmax, bbox2.xmax);
                         intersect_bbox.ymax = min(bbox1.ymax, bbox2.ymax);
 
-                        float intersect_size = compute_size(intersect_bbox), overlap = 0.0;
+                        float intersect_size = compute_size<NORMALIZED_BBOX>(intersect_bbox), overlap = 0.0;
                         if (intersect_size > 0)
                         {
-                            float bbox1_size = compute_size(bbox1);
-                            float bbox2_size = compute_size(bbox2);
+                            float bbox1_size = compute_size<NORMALIZED_BBOX>(bbox1);
+                            float bbox2_size = compute_size<NORMALIZED_BBOX>(bbox2);
                             overlap = intersect_size / (bbox1_size + bbox2_size - intersect_size);
                         }
 
@@ -417,38 +461,65 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
 
             __syncthreads();
 
-            if (threadIdx.x == 0)
+            for (int c = 0; c < num_classes; c++)
             {
-                for (int c = 0; c < num_classes; c++)
+                if (c == background_label_id)
+                    continue;
+
+                auto boxes = count[b * num_classes + c];
+                for (auto i : block_stride_range(boxes))
                 {
-                    if (c == background_label_id)
-                        continue;
+                    auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
+                    const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + prior_id];
 
-                    auto boxes = count[b * num_classes + c];
-                    for (int i = 0; i < boxes; i++)
-                    {
-                        auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
-                        const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + prior_id];
+                    using device::clamp;
+                    int bin_index = confidence * BINS;
+                    bin_index = clamp<int>(bin_index, 0, BINS - 1);
 
-                        using device::clamp;
-                        int bin_index = confidence * BINS;
-                        bin_index = clamp<int>(bin_index, 0, BINS - 1);
-
-                        atomicAdd(&bins[bin_index], 1);
-                    }
+                    atomicAdd(&bins[bin_index], 1);
                 }
             }
 
             __syncthreads();
 
-            if (threadIdx.x == 0)
+            if (threadIdx.x < warpSize)
             {
-                for (int i = 0; i < BINS - 1; i++)
-                    bins[i] = bins[i + 1];
-                bins[BINS - 1] = 0;
+                for (int i = threadIdx.x; i < BINS - 1; i += warpSize)
+                {
+                    auto temp = bins[i + 1];
+                    __syncwarp();
+                    bins[i] = temp;
+                    // bins[i] won't be read again => no need for __syncwarp here
+                }
 
-                for (int i = BINS - 1; i > 0; i--)
-                    bins[i - 1] += bins[i];
+                if (threadIdx.x == 0)
+                    bins[BINS - 1] = 0;
+
+                constexpr int group_size = 32; /* must be equal to warpSize */
+                assert(group_size == warpSize);
+
+                static_assert(BINS % group_size == 0, "number of bins must be a multiple of warpSize");
+
+                const auto inverse_lane_id = group_size - threadIdx.x - 1;
+                unsigned int previous_group_first_element = 0;
+
+                for (int warp_id = BINS / group_size - 1; warp_id >= 0; warp_id--)
+                {
+                    auto idx = warp_id * group_size + threadIdx.x;
+                    auto value = bins[idx];
+
+                    for (int i = 1; i < group_size; i *= 2)
+                    {
+                        int n = __shfl_down_sync(0xFFFFFFFF, value, i);
+                        if (inverse_lane_id >= i)
+                            value += n;
+                    }
+
+                    value += previous_group_first_element;
+                    bins[idx] = value;
+
+                    previous_group_first_element = __shfl_sync(0xFFFFFFFF, value, 0);
+                }
             }
 
             if (threadIdx.x == 0)
@@ -456,28 +527,25 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
 
             __syncthreads();
 
-            if (threadIdx.x == 0)
+            for (int c = 0; c < num_classes; c++)
             {
-                for (int c = 0; c < num_classes; c++)
+                if (c == background_label_id)
+                    continue;
+
+                auto boxes = count[b * num_classes + c];
+                for (auto i : block_stride_range(boxes))
                 {
-                    if (c == background_label_id)
-                        continue;
+                    auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
+                    const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + prior_id];
 
-                    auto boxes = count[b * num_classes + c];
-                    for (int i = 0; i < boxes; i++)
+                    int bin_index = confidence * BINS;
+                    bin_index = clamp<int>(bin_index, 0, BINS - 1);
+
+                    const index_type idx = atomicAdd(&bins[bin_index], 1);
+                    if (idx < keepTopK)
                     {
-                        auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
-                        const float confidence = scores[b * (num_classes * num_priors) + c * num_priors + prior_id];
-
-                        int bin_index = confidence * BINS;
-                        bin_index = clamp<int>(bin_index, 0, BINS - 1);
-
-                        const index_type idx = atomicAdd(&bins[bin_index], 1);
-                        if (idx < keepTopK)
-                        {
-                            kept_indices[b * keepTopK + idx] = c * num_priors + prior_id;
-                            atomicAdd(&kept_count[b], 1);
-                        }
+                        kept_indices[b * keepTopK + idx] = c * num_priors + prior_id;
+                        atomicAdd(&kept_count[b], 1);
                     }
                 }
             }
@@ -589,7 +657,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         auto num_priors = scores.get_axis_size(2);
 
         auto num_blocks = batch_size * num_classes;
-        auto num_threads = std::min<std::size_t>(1024, num_priors);
+        auto num_threads = std::max<std::size_t>(std::min<std::size_t>(1024, num_priors), 32);
         auto class_offset = 0;
         index_type optimized_bg_label_id = background_label_id;
 
@@ -641,7 +709,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         CV_Assert(decoded_bboxes.get_axis_size(0) == batch_size);
 
         auto num_blocks = batch_size * num_classes;
-        auto num_threads = std::min<std::size_t>(1024, top_k);
+        auto num_threads = std::max<std::size_t>(std::min<std::size_t>(1024, top_k), 32);
 
         auto class_offset = 0;
         index_type optimized_bg_label_id = background_label_id;
@@ -717,7 +785,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         dim3 block_size(num_threads);
         auto policy = execution_policy(grid_size, block_size, stream);
 
-        auto kernel = raw::nms_collect<T, 256>;
+        auto kernel = raw::nms_collect<T, 512>;
         launch_kernel(kernel, policy, kept_indices, kept_count, indices, count, scores, num_classes, num_priors, classwise_topK, keepTopK, background_label_id);
     }
 

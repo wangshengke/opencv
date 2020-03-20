@@ -114,6 +114,11 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             // priors: [1, 2, num_priors, 4]
             auto priors_wrapper = inputs[2].dynamicCast<wrapper_type>();
             auto priors = priors_wrapper->getView();
+            {
+                /* TODO: for some reason, the priors wrapper contains the wrong shape, i.e. [1, 1, num_priors * 4] */
+                auto shape = std::vector<std::size_t>{1, 2, num_priors, 4};
+                priors = csl::TensorView<T>(priors.get(), std::begin(shape), std::end(shape));
+            }
 
             // output: [1, 1, batch_size * keepTopK, 7]
             auto output_wrapper = outputs[0].dynamicCast<wrapper_type>();
@@ -121,8 +126,8 @@ namespace cv { namespace dnn { namespace cuda4dnn {
 
             auto batch_size = locations.get_axis_size(0);
             auto num_loc_classes = (share_location ? 1 : num_classes);
-            locations.unsqueeze();
-            locations.unsqueeze();
+            while(locations.rank() < 4)
+                locations.unsqueeze();
             locations.reshape(batch_size, num_priors, num_loc_classes, 4);
 
             float clip_width = 0.0, clip_height = 0.0;
@@ -150,16 +155,6 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             {
                 auto shape = std::vector<std::size_t>{batch_size, num_priors, num_loc_classes, 4};
                 decoded_boxes = allocator.get_tensor_span<T>(std::begin(shape), std::end(shape));
-
-                // std::cout << "decoded_boxes: ";
-                // for (auto i : decoded_boxes.shape_as_vector())
-                //     std::cout << i << ' ';
-                // std::cout << std::endl;
-
-                // std::cout << "locations: ";
-                // for (auto i : locations.shape_as_vector())
-                //     std::cout << i << ' ';
-                // std::cout << std::endl;
                 CV_Assert(is_shape_same(decoded_boxes, locations));
             }
 
