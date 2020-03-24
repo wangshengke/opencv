@@ -295,7 +295,9 @@ TEST_P(Test_TensorFlow_layers, pooling)
 {
     runTensorFlowNet("max_pool_even");
     runTensorFlowNet("max_pool_odd_valid");
-    runTensorFlowNet("max_pool_odd_same");
+    runTensorFlowNet("max_pool_odd_same", false,
+        (target == DNN_TARGET_CUDA_FP16 ? 0.006 : 0.0),
+        (target == DNN_TARGET_CUDA_FP16 ? 0.1: 0.0));
     runTensorFlowNet("reduce_mean");  // an average pooling over all spatial dimensions.
 }
 
@@ -507,6 +509,7 @@ TEST_P(Test_TensorFlow_nets, MobileNet_SSD)
     }
     else if (target == DNN_TARGET_CUDA_FP16)
     {
+        scoreDiff = 0.005;
         iouDiff = 0.04;
     }
     normAssertDetections(ref, out, "", 0.2, scoreDiff, iouDiff);
@@ -685,7 +688,7 @@ TEST_P(Test_TensorFlow_nets, MobileNet_v1_SSD_PPN)
     }
     else if (target == DNN_TARGET_CUDA_FP16)
     {
-        scoreDiff = 0.006;
+        scoreDiff = 0.02;
         iouDiff = 0.05;
     }
     normAssertDetections(ref, out, "", 0.45, scoreDiff, iouDiff);
@@ -820,12 +823,14 @@ TEST_P(Test_TensorFlow_layers, fp16_weights)
     float l1 = 0.00078;
     float lInf = 0.012;
     runTensorFlowNet("fp16_single_conv", false, l1, lInf);
-    runTensorFlowNet("fp16_max_pool_odd_same", false, l1, lInf);
+    runTensorFlowNet("fp16_max_pool_odd_same", false,
+        target == DNN_TARGET_CUDA_FP16 ? 0.004 : l1,
+        target == DNN_TARGET_CUDA_FP16 ? 0.08 : lInf);
     runTensorFlowNet("fp16_eltwise_add_mul", false, l1, lInf);
     runTensorFlowNet("fp16_pad_and_concat", false, l1, lInf);
-    runTensorFlowNet("fp16_padding_valid", false, l1, lInf);
+    runTensorFlowNet("fp16_padding_valid", false, l1, lInf);std::cout << "2";
     // Reference output values are in range [0.0889, 1.651]
-    runTensorFlowNet("fp16_max_pool_even", false, (target == DNN_TARGET_MYRIAD) ? 0.003 : l1, lInf);
+    runTensorFlowNet("fp16_max_pool_even", false, (target == DNN_TARGET_MYRIAD || target == DNN_TARGET_CUDA_FP16) ? 0.003 : l1, lInf);
     if (target == DNN_TARGET_MYRIAD)
     {
         l1 = 0.0041;
@@ -834,7 +839,7 @@ TEST_P(Test_TensorFlow_layers, fp16_weights)
     // Reference output values are in range [0, 10.75]
     runTensorFlowNet("fp16_deconvolution", false, l1, lInf);
     // Reference output values are in range [0.418, 2.297]
-    runTensorFlowNet("fp16_max_pool_odd_valid", false, l1, lInf);
+    runTensorFlowNet("fp16_max_pool_odd_valid", false, target == DNN_TARGET_CUDA_FP16 ? 0.002 : l1, lInf);
 }
 
 TEST_P(Test_TensorFlow_layers, fp16_padding_same)
